@@ -1,0 +1,265 @@
+#!/usr/bin/env node
+// 辰屿 Pro CLI —— 剧本生产平台的命令行入口（操作员模式：提交/盯进度/交付，
+// 写作与质量硬门全在服务端，提示词不出服务器）。零依赖，Node 18+。
+// 配置存 ~/.codex/chenyu-pro/config.json（KEY/session 掩码显示，绝不写入日志）。
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+
+const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
+const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
+const DEFAULT_PLATFORM = 'https://chenyu.pumpumai.com';
+const DEFAULT_CREDIT_BASE = 'https://drama.pumpumai.com';
+
+// 每集消耗经验值（分）——按主力模型，含 Flash 辅助地板 ~40 分（2026-07 实测口径）
+const COST_PER_EPISODE = { 'auto': 113, 'deepseek-v4-pro': 113, 'grok-4.5': 77, 'gpt-5.6-luna': 77, 'gemini-3.5-flash': 77, 'gpt-5.6-sol': 151 };
+const MARKETS = {
+  us_en: '英语·欧美', latam_es: '西语·拉美', brazil_pt: '葡语·巴西', japan_ja: '日本',
+  korea_ko: '韩国', thailand_th: '泰国', vietnam_vi: '越南', indonesia_id: '印尼', cn_reskin: '中文换背景'
+};
+
+const args = process.argv.slice(2);
+const cmd = args[0] || 'help';
+const arg = (name, fallback = '') => {
+  const i = args.indexOf('--' + name);
+  return i >= 0 && args[i + 1] !== undefined ? args[i + 1] : fallback;
+};
+const flag = (name) => args.includes('--' + name);
+
+function loadConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch { return {}; }
+}
+function saveConfig(cfg) {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
+}
+const mask = (v) => (v && v.length > 10 ? v.slice(0, 6) + '****' + v.slice(-4) : v ? '****' : '(未设置)');
+const die = (msg) => { console.error('✗ ' + msg); process.exit(1); };
+
+async function api(pathName, { method = 'GET', body, auth = true, base } = {}) {
+  const cfg = loadConfig();
+  const url = (base || cfg.platform_base || DEFAULT_PLATFORM) + pathName;
+  const headers = { 'Content-Type': 'application/json' };
+  if (auth) {
+    if (!cfg.session_token) die('未登录——先运行: chenyu-pro login --username <账号> --password <密码>');
+    headers.Authorization = 'Bearer ' + cfg.session_token;
+  }
+  const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && auth) die('登录已失效，请重新 chenyu-pro login');
+  if (!res.ok || data.ok === false || data.success === false) die(`${pathName} 失败(${res.status}): ${data.error || JSON.stringify(data).slice(0, 200)}`);
+  return data;
+}
+
+async function creditApi(pathName) {
+  const cfg = loadConfig();
+  const key = cfg.credit_key || '';
+  if (!key) die('未绑定积分 KEY——先运行: chenyu-pro key set <你的KEY>');
+  const res = await fetch((cfg.credit_base || DEFAULT_CREDIT_BASE) + pathName, { headers: { Authorization: 'Bearer ' + key } });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.success === false) die(`积分查询失败(${res.status}): ${data.error || ''}`);
+  return data;
+}
+
+// ---------- 命令 ----------
+async function cmdLogin() {
+  const username = arg('username');
+  const password = arg('password');
+  if (!username || !password) die('用法: chenyu-pro login --username <账号> --password <密码>');
+  const data = await api('/api/auth/login', { method: 'POST', auth: false, body: { identifier: username, password } });
+  const cfg = loadConfig();
+  cfg.platform_base = arg('base', cfg.platform_base || DEFAULT_PLATFORM);
+  cfg.session_token = data.token;
+  cfg.username = data.user?.display_name || username;
+  saveConfig(cfg);
+  console.log(`✓ 已登录: ${cfg.username} | 平台: ${cfg.platform_base}`);
+  // 平台账号里已绑 KEY 的话自动带下来
+  try {
+    const me = await api('/api/auth/me');
+    const remoteKey = me.settings?.pix_credit_key || me.settings?.credit_key || '';
+    if (remoteKey && !cfg.credit_key) { cfg.credit_key = remoteKey; saveConfig(cfg); console.log('✓ 已从平台账号同步积分 KEY: ' + mask(remoteKey)); }
+  } catch { /* 可选步骤 */ }
+}
+
+async function cmdKey() {
+  const sub = args[1];
+  const cfg = loadConfig();
+  if (sub === 'set') {
+    const key = args[2] || '';
+    if (!key.trim()) die('用法: chenyu-pro key set <积分KEY>');
+    cfg.credit_key = key.trim();
+    saveConfig(cfg);
+    // 同步进平台账号 settings（服务端生成时用它计费）
+    try { await api('/api/settings', { method: 'PATCH', body: { pix_credit_key: key.trim() } }); console.log('✓ KEY 已保存并同步到平台账号: ' + mask(key)); }
+    catch { console.log('✓ KEY 已保存到本地: ' + mask(key) + '（平台同步失败，登录后重试 key set）'); }
+  } else {
+    console.log('积分 KEY: ' + mask(cfg.credit_key || ''));
+  }
+}
+
+async function cmdCredits() {
+  const data = await creditApi('/api/jimeng/v1/key');
+  const k = data.key || {};
+  console.log(`KEY: ${k.name || ''} (${k.keyMasked || ''})`);
+  console.log(`余额: ${k.pointsBalance ?? '?'} 分 | 冻结: ${k.pointsReserved ?? 0} | 累计消耗: ${k.pointsSpent ?? 0}`);
+  const perEp = COST_PER_EPISODE.auto;
+  if (Number.isFinite(k.pointsBalance)) console.log(`≈ 还能生成 ${Math.floor(k.pointsBalance / perEp)} 集（默认模型口径）`);
+}
+
+async function cmdEstimate() {
+  const episodes = Number(arg('episodes', '30'));
+  const model = arg('model', 'auto');
+  const perEp = COST_PER_EPISODE[model] ?? COST_PER_EPISODE.auto;
+  const directorCut = flag('director-cut') ? 15 : 0;
+  const total = Math.round(episodes * (perEp + directorCut) * 1.2); // 1.2 重试缓冲
+  console.log(`预估: ${episodes} 集 × (${perEp}${directorCut ? '+' + directorCut + '制片级' : ''}) × 1.2缓冲 ≈ ${total} 分`);
+  try {
+    const k = (await creditApi('/api/jimeng/v1/key')).key || {};
+    const ok = Number(k.pointsBalance) >= total;
+    console.log(`余额: ${k.pointsBalance} 分 → ${ok ? '✓ 足够' : '✗ 不足，请先充值'}`);
+    if (!ok) process.exit(2);
+  } catch { console.log('（未绑定 KEY，跳过余额校验）'); }
+}
+
+function buildRewriteDirective(marketKey, extra) {
+  // 市场规则块（与网页创作台一致的公开层；核心写作/审核方法论在服务端，不在此处）
+  const M = {
+    us_en: ['美国当代都市/海滨小镇', '美元', '人物改用地道欧美英文名，家族同姓一致；禁止汉语拼音姓氏与源名谐音；场景人物行用全名，台词行与动作行只用名字 First name。', '称谓按欧美习惯。'],
+    latam_es: ['墨西哥/哥伦比亚当代都市', '美元', '人物改用西语名，家族同姓一致；禁止拼音姓氏与源名谐音；场景人物行用全名，台词行只用名字。', '称谓按拉美习惯。'],
+    brazil_pt: ['巴西里约/圣保罗当代都市', '美元', '人物改用巴西葡语名，家族同姓一致；禁止拼音姓氏与源名谐音；场景人物行用全名，台词行只用名字。', '称谓按巴西习惯。'],
+    japan_ja: ['日本当代都市/沿海町', '日元', '人物改用日式姓名（汉字书写，姓在前），家族同姓一致；禁止保留中文原名或谐音；对话用日式敬称，正文仍中文书写。', '称谓按日本习惯。'],
+    korea_ko: ['韩国首尔/釜山当代都市', '韩元', '人物改用韩式姓名（中文谐音汉字书写，姓在前），家族同姓一致；禁止保留原名；对话体现敬语层级，正文中文书写。', '称谓按韩国习惯。'],
+    thailand_th: ['泰国曼谷/海岛当代都市', '泰铢', '人物改用泰式姓名+昵称制（中文书写音译）；家族关系一致；禁止保留原名或谐音。', '称谓按泰国习惯。'],
+    vietnam_vi: ['越南胡志明市/沿海当代都市', '越南盾', '人物改用越式姓名（中文书写音译，姓在前）；家族同姓一致；禁止保留原名或谐音。', '称谓按越南习惯。'],
+    indonesia_id: ['印尼雅加达/巴厘岛当代都市', '印尼盾', '人物改用印尼名，可单名；家族关系一致；禁止拼音姓氏与源名谐音。', '称谓按印尼习惯。'],
+    cn_reskin: ['', '', '人物更换新的中文姓名，家族姓氏与关系一致，禁止沿用原名或谐音名。', '称谓按新背景调整。']
+  };
+  const [setting, currency, nameRule, kinship] = M[marketKey] || M.us_en;
+  return [
+    '洗稿换壳改编：严格保留原剧情骨架、每集节拍、场次顺序、情绪曲线与钩子位置；每段源台词与可见节拍都要有功能等价物，禁止删减。',
+    setting ? `目标市场：${MARKETS[marketKey]}。目标背景设定：${setting}。所有时代、场景、职业体系迁移为该市场的等价物。` : `目标市场：${MARKETS[marketKey]}。`,
+    nameRule,
+    `地名、机构名、称谓、头衔全部替换为该市场等价物；${currency ? `货币单位一律用${currency}，` : ''}全剧统一换算基准，系统面板数字等比换算且跨集自洽。${kinship}`,
+    '台词与叙述全部重写，语义可保留但表达不得照抄原文。正文保持中文书写（人名、地名、机构名、货币按目标市场）。',
+    extra ? `补充要求：${extra}` : ''
+  ].filter(Boolean).join('\n');
+}
+
+async function cmdSubmit() {
+  const mode = arg('mode', 'rewrite'); // rewrite | adaptation | original 暂主打 rewrite/adaptation
+  const title = arg('title') || die('缺 --title 剧名');
+  const episodes = Number(arg('episodes', '30'));
+  const sourceFile = arg('source');
+  const market = arg('market', 'us_en');
+  const model = arg('model', '');
+  const extra = arg('extra', '');
+  const batch = Number(arg('batch', '3'));
+  const duration = Number(arg('duration', '90'));
+  if (mode !== 'original' && !sourceFile) die('rewrite/adaptation 模式需要 --source <源文件.txt/.md>');
+  if (mode === 'rewrite' && !MARKETS[market]) die('未知市场: ' + market + '，可选: ' + Object.keys(MARKETS).join('/'));
+  const sourceText = sourceFile ? fs.readFileSync(path.resolve(sourceFile), 'utf8') : '';
+  if (sourceFile && sourceText.trim().length < 100) die('源文本太短');
+
+  const directive = mode === 'rewrite' ? buildRewriteDirective(market, extra) : (extra || '按原剧情忠实改编');
+  const body = {
+    title, working_title: title,
+    mode: mode === 'original' ? 'original' : 'adaptation',
+    total_episodes: episodes, batch_episodes: batch,
+    quality_tier: arg('quality', 'strong_review'),
+    episode_duration_seconds: duration,
+    config: {
+      genre: arg('genre', mode === 'rewrite' ? MARKETS[market] + '洗稿' : '待确认'),
+      audience: arg('audience', '待确认'),
+      production_format: '真人剧', source_type: 'source_text',
+      model_strategy: 'balanced', research_window_days: 30,
+      episode_duration_seconds: duration,
+      adaptation_directive: directive,
+      config_json: {
+        created_from: 'chenyu-pro-cli',
+        ...(mode === 'rewrite' ? { market } : {}),
+        ...(model && model !== 'auto' ? { writer_model: model } : {}),
+        ...(flag('director-cut') ? { director_cut: true } : {})
+      }
+    }
+  };
+  const created = await api('/api/projects', { method: 'POST', body });
+  const pid = created.project.id;
+  console.log('✓ 项目已创建: ' + pid);
+  if (sourceText) {
+    await api(`/api/projects/${pid}/files`, { method: 'POST', body: { filename: path.basename(sourceFile), title: '源材料', type: 'source_file', step_id: 'A01A', content: sourceText } });
+    console.log('✓ 源文件已上传 (' + sourceText.length + ' 字)');
+  }
+  const started = await api(`/api/projects/${pid}/workflow/start-auto`, { method: 'POST', body: {} });
+  console.log('✓ 已开跑: job=' + (started.job?.id || '?'));
+  console.log(`下一步: chenyu-pro status --project ${pid.slice(-8)} [--watch]`);
+}
+
+async function findProject(fragment) {
+  const data = await api('/api/projects');
+  const list = data.projects || [];
+  const hit = list.find((p) => p.id.includes(fragment) || String(p.title || '').includes(fragment));
+  if (!hit) die('找不到项目: ' + fragment);
+  return hit;
+}
+
+async function cmdStatus() {
+  const fragment = arg('project') || die('缺 --project <id片段或剧名>');
+  const watch = flag('watch');
+  for (;;) {
+    const p = await findProject(fragment);
+    const line = `[${new Date().toLocaleTimeString()}] ${p.title} | 状态:${p.status} | 步骤:${p.current_step || '-'} | 集:${p.current_episode || '-'} | 完成:${p.completed_episodes ?? 0}/${p.total_episodes}`;
+    console.log(line);
+    if (!watch || ['completed', 'failed'].includes(String(p.status))) break;
+    await new Promise((r) => setTimeout(r, 30000));
+  }
+}
+
+async function cmdFetch() {
+  const fragment = arg('project') || die('缺 --project');
+  const outDir = path.resolve(arg('out', './chenyu-pro-output'));
+  const p = await findProject(fragment);
+  const arts = (await api(`/api/projects/${p.id}/artifacts`)).artifacts || [];
+  const texts = arts.filter((a) => /第\d+集正文\.md$/.test(String(a.title || '')));
+  const byTitle = new Map();
+  for (const a of texts) { const prev = byTitle.get(a.title); if (!prev || (a.version || 0) > (prev.version || 0)) byTitle.set(a.title, a); }
+  const eps = [...byTitle.values()].sort((x, y) => String(x.episode || '').localeCompare(String(y.episode || '')));
+  if (!eps.length) die('该项目还没有正文产物（未完成或未生成）');
+  fs.mkdirSync(outDir, { recursive: true });
+  const merged = [];
+  for (const a of eps) {
+    const content = String((await api(`/api/artifacts/${a.id}/content`)).content || '');
+    const fileName = a.title.replace(/^.*?(第\d+集正文\.md)$/, '$1').replace(/\.md$/, '.txt');
+    fs.writeFileSync(path.join(outDir, fileName), content, 'utf8');
+    merged.push(content.trim());
+  }
+  fs.writeFileSync(path.join(outDir, '全剧合并.txt'), merged.join('\n\n'), 'utf8');
+  console.log(`✓ 已导出 ${eps.length} 集到 ${outDir}（含 全剧合并.txt）`);
+}
+
+async function cmdProjects() {
+  const data = await api('/api/projects');
+  for (const p of (data.projects || []).slice(0, 15)) {
+    console.log(`${p.id.slice(-12)}  ${String(p.status).padEnd(10)} ${p.completed_episodes ?? 0}/${p.total_episodes}集  ${p.title}`);
+  }
+}
+
+function cmdHelp() {
+  console.log(`辰屿 Pro CLI —— 剧本生产平台命令行
+
+  chenyu-pro login --username <账号> --password <密码>     登录平台（session 存本地）
+  chenyu-pro key set <积分KEY> | key show                  绑定/查看积分 KEY（掩码）
+  chenyu-pro credits                                       查余额/冻结/累计消耗
+  chenyu-pro estimate --episodes 30 [--model grok-4.5] [--director-cut]   预估消耗+余额校验
+  chenyu-pro submit --mode rewrite --title <剧名> --episodes 30 \\
+      --source 源剧本.txt --market japan_ja [--model grok-4.5] \\
+      [--director-cut] [--extra "补充要求"] [--batch 3] [--duration 90]
+  chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
+  chenyu-pro fetch --project <id片段> --out <目录>          导出交付正文
+  chenyu-pro projects                                      项目列表
+
+  市场: ${Object.entries(MARKETS).map(([k, v]) => k + '=' + v).join(' ')}
+  模型: auto(默认DS Pro) grok-4.5 gpt-5.6-luna gpt-5.6-sol gemini-3.5-flash`);
+}
+
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, estimate: cmdEstimate, submit: cmdSubmit, status: cmdStatus, fetch: cmdFetch, projects: cmdProjects, help: cmdHelp };
+await (commands[cmd] || cmdHelp)();
