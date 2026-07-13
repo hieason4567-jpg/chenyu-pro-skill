@@ -255,18 +255,43 @@ async function cmdFetch() {
   const outDir = path.resolve(arg('out', './chenyu-pro-output'));
   const p = await findProject(fragment);
   const arts = (await api(`/api/projects/${p.id}/artifacts`)).artifacts || [];
-  const texts = arts.filter((a) => /第\d+集正文\.md$/.test(String(a.title || '')));
-  const byTitle = new Map();
-  for (const a of texts) { const prev = byTitle.get(a.title); if (!prev || (a.version || 0) > (prev.version || 0)) byTitle.set(a.title, a); }
-  const eps = [...byTitle.values()].sort((x, y) => String(x.episode || '').localeCompare(String(y.episode || '')));
+  const texts = arts.filter((a) => /第\d+集正文/.test(String(a.title || '')));
+  // 每集选一份：交付版(03_正文_) > 可读版 > 其他；A15 原始步骤记录（带
+  // step_id/model 元数据头）绝不能发给用户。
+  const epOf = (a) => {
+    const m = String(a.title || '').match(/第(\d+)集正文/);
+    return m ? m[1] : String(a.episode || '');
+  };
+  const score = (a) => {
+    const t = String(a.title || '');
+    let s = 0;
+    if (/^03_正文_/.test(t)) s += 100;
+    if (/readable|可读/i.test(t)) s += 10;
+    if (/返修/.test(t)) s -= 3;
+    if (/^A\d/.test(t)) s -= 5;
+    return s;
+  };
+  const byEp = new Map();
+  for (const a of texts) {
+    const ep = epOf(a);
+    const prev = byEp.get(ep);
+    if (!prev || score(a) > score(prev) || (score(a) === score(prev) && String(a.created_at || '') > String(prev.created_at || ''))) byEp.set(ep, a);
+  }
+  const eps = [...byEp.entries()].sort((x, y) => x[0].localeCompare(y[0])).map(([, a]) => a);
   if (!eps.length) die('该项目还没有正文产物（未完成或未生成）');
+  // 剥掉步骤元数据头（"# A15 …"、"- step_id: …"等），正文从集标题/场景头开始。
+  const stripMeta = (text) => {
+    const lines = String(text || '').split(/\r?\n/);
+    const start = lines.findIndex((l) => /^第\d+集/.test(l.trim()) || /^\d+-\d+\s/.test(l.trim()));
+    return start > 0 ? lines.slice(start).join('\n') : text;
+  };
   fs.mkdirSync(outDir, { recursive: true });
   const merged = [];
   for (const a of eps) {
-    const content = String((await api(`/api/artifacts/${a.id}/content`)).content || '');
-    const fileName = a.title.replace(/^.*?(第\d+集正文\.md)$/, '$1').replace(/\.md$/, '.txt');
+    const content = stripMeta(String((await api(`/api/artifacts/${a.id}/content`)).content || '')).trim();
+    const fileName = `第${epOf(a)}集正文.txt`;
     fs.writeFileSync(path.join(outDir, fileName), content, 'utf8');
-    merged.push(content.trim());
+    merged.push(content);
   }
   fs.writeFileSync(path.join(outDir, '全剧合并.txt'), merged.join('\n\n'), 'utf8');
   console.log(`✓ 已导出 ${eps.length} 集到 ${outDir}（含 全剧合并.txt）`);
