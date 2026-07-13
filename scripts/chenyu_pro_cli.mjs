@@ -6,6 +6,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
+// 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
+//                    并剥步骤元数据; help 文案更新
+// v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
+const VERSION = '1.1.0';
+
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 const DEFAULT_PLATFORM = 'https://chenyu.pumpumai.com';
@@ -304,8 +310,12 @@ async function cmdProjects() {
   }
 }
 
+function cmdVersion() {
+  console.log(`chenyu-pro v${VERSION}`);
+}
+
 function cmdHelp() {
-  console.log(`辰屿 Pro CLI —— 剧本生产平台命令行
+  console.log(`辰屿 Pro CLI v${VERSION} —— 剧本生产平台命令行
 
   chenyu-pro key set <积分KEY> | key show                  绑定积分 KEY（绑定后平台自动免密登录）
   chenyu-pro login --username <账号> --password <密码>     密码登录（没有 KEY 时才需要）
@@ -319,8 +329,9 @@ function cmdHelp() {
   chenyu-pro projects                                      项目列表
 
   市场: ${Object.entries(MARKETS).map(([k, v]) => k + '=' + v).join(' ')}
-  模型: auto(默认DS Pro) grok-4.5 gpt-5.6-luna gpt-5.6-sol gemini-3.5-flash`);
+  模型: auto(默认DS Pro) grok-4.5 gpt-5.6-luna gpt-5.6-sol gemini-3.5-flash
+  升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, estimate: cmdEstimate, submit: cmdSubmit, status: cmdStatus, fetch: cmdFetch, projects: cmdProjects, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, estimate: cmdEstimate, submit: cmdSubmit, status: cmdStatus, fetch: cmdFetch, projects: cmdProjects, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 await (commands[cmd] || cmdHelp)();
