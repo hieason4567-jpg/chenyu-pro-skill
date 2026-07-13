@@ -7,10 +7,12 @@ import path from 'node:path';
 import os from 'node:os';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.2.0 2026-07-13  新增 sync 命令: 成品剧本同步到云端脚本库, 辰屿客户端可下载
+//                    (CLI 与客户端用同一积分 KEY 时互通)
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -303,6 +305,16 @@ async function cmdFetch() {
   console.log(`✓ 已导出 ${eps.length} 集到 ${outDir}（含 全剧合并.txt）`);
 }
 
+async function cmdSync() {
+  const fragment = arg('project') || die('缺 --project <id片段或剧名>');
+  const p = await findProject(fragment);
+  // 复用平台云同步端点：成品正文打成客户端剧本包传 H1 云端脚本库（按 KEY 隔离）。
+  // CLI 与辰屿客户端用同一个积分 KEY 时，客户端"云端脚本"点刷新即可下载。
+  const res = await api(`/api/projects/${p.id}/cloud-sync`, { method: 'POST', body: {} });
+  console.log(`✓ 已同步到云端脚本库：《${p.title}》${res.episodes} 集`);
+  console.log('  辰屿客户端"云端脚本"点刷新即可下载（需与 CLI 用同一积分 KEY）');
+}
+
 async function cmdProjects() {
   const data = await api('/api/projects');
   for (const p of (data.projects || []).slice(0, 15)) {
@@ -325,7 +337,8 @@ function cmdHelp() {
       --source 源剧本.txt --market japan_ja [--model grok-4.5] \\
       [--director-cut] [--extra "补充要求"] [--batch 3] [--duration 90]
   chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
-  chenyu-pro fetch --project <id片段> --out <目录>          导出交付正文
+  chenyu-pro fetch --project <id片段> --out <目录>          导出交付正文到本地
+  chenyu-pro sync --project <id片段|剧名>                   同步到云端脚本库（辰屿客户端可下载）
   chenyu-pro projects                                      项目列表
 
   市场: ${Object.entries(MARKETS).map(([k, v]) => k + '=' + v).join(' ')}
@@ -333,5 +346,5 @@ function cmdHelp() {
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, estimate: cmdEstimate, submit: cmdSubmit, status: cmdStatus, fetch: cmdFetch, projects: cmdProjects, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, estimate: cmdEstimate, submit: cmdSubmit, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 await (commands[cmd] || cmdHelp)();
