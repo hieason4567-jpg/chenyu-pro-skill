@@ -1,4 +1,4 @@
-# 辰屿 Pro Skill 一行安装（Windows）：
+﻿# 辰屿 Pro Skill 一行安装（Windows）：
 #   irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex
 # 装到 Codex + Claude Code 的 skills 目录，并创建全局 chenyu-pro 命令。需 Node 18+。
 $ErrorActionPreference = "Stop"
@@ -38,6 +38,6 @@ Write-Host ""
 & node $cliPath help | Select-Object -First 2
 Write-Host ""
 Write-Host "Install complete. First use:" -ForegroundColor Green
-Write-Host "  chenyu-pro login --username <account> --password <password>"
-Write-Host "  chenyu-pro key set <credit-key>"
+Write-Host "  chenyu-pro key set <credit-key>   (auto sign-in, no password needed)"
 Write-Host "  chenyu-pro credits"
+exit 0
