@@ -5,14 +5,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { exec } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.3.0 2026-07-13  新增 login --web 网页授权：浏览器登录真账号后授权命令行，
+//                    CLI 以你的账号登录(项目归网页账号, KEY 作为账号属性自动跟过来)
 // v1.2.0 2026-07-13  新增 sync 命令: 成品剧本同步到云端脚本库, 辰屿客户端可下载
 //                    (CLI 与客户端用同一积分 KEY 时互通)
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -106,23 +109,53 @@ async function creditApi(pathName) {
 }
 
 // ---------- 命令 ----------
-async function cmdLogin() {
-  const username = arg('username');
-  const password = arg('password');
-  if (!username || !password) die('用法: chenyu-pro login --username <账号> --password <密码>');
-  const data = await api('/api/auth/login', { method: 'POST', auth: false, body: { identifier: username, password } });
-  const cfg = loadConfig();
+// 登录后同步账号身份 + 账号名下的积分 KEY（KEY 是账号属性，登录真账号即带出）。
+async function afterLogin(cfg, token, displayName) {
   cfg.platform_base = arg('base', cfg.platform_base || DEFAULT_PLATFORM);
-  cfg.session_token = data.token;
-  cfg.username = data.user?.display_name || username;
+  cfg.session_token = token;
+  cfg.username = displayName || cfg.username || '';
   saveConfig(cfg);
-  console.log(`✓ 已登录: ${cfg.username} | 平台: ${cfg.platform_base}`);
-  // 平台账号里已绑 KEY 的话自动带下来
+  console.log(`✓ 已登录: ${cfg.username || '(账号)'} | 平台: ${cfg.platform_base}`);
   try {
     const me = await api('/api/auth/me');
     const remoteKey = me.settings?.pix_credit_key || me.settings?.credit_key || '';
-    if (remoteKey && !cfg.credit_key) { cfg.credit_key = remoteKey; saveConfig(cfg); console.log('✓ 已从平台账号同步积分 KEY: ' + mask(remoteKey)); }
+    if (remoteKey) { cfg.credit_key = remoteKey; saveConfig(cfg); console.log('✓ 已带出账号名下积分 KEY: ' + mask(remoteKey)); }
   } catch { /* 可选步骤 */ }
+}
+
+function openBrowser(u) {
+  const cmd = process.platform === 'win32' ? `start "" "${u}"` : process.platform === 'darwin' ? `open "${u}"` : `xdg-open "${u}"`;
+  try { exec(cmd); } catch { /* 打不开就让用户手动复制 */ }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function cmdLogin() {
+  // 网页授权（推荐）：以你的真账号登录，项目归网页账号，KEY 自动带出。
+  if (flag('web')) {
+    const base = arg('base', loadConfig().platform_base || DEFAULT_PLATFORM);
+    const start = await fetch(base + '/api/auth/cli/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then((r) => r.json());
+    if (!start?.device_code) die('发起网页授权失败，请重试或检查网络');
+    console.log('请在浏览器用你的账号登录并点【确认授权】：');
+    console.log('  ' + start.verify_url);
+    console.log('  授权码: ' + start.user_code + '（页面已带上，无需手输）');
+    openBrowser(start.verify_url);
+    const deadline = Date.now() + (start.expires_in || 600) * 1000;
+    process.stdout.write('等待网页授权');
+    while (Date.now() < deadline) {
+      await sleep((start.interval || 3) * 1000);
+      process.stdout.write('.');
+      const p = await fetch(base + '/api/auth/cli/poll', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device_code: start.device_code }) }).then((r) => r.json()).catch(() => ({}));
+      if (p.status === 'approved') { process.stdout.write('\n'); await afterLogin(loadConfig(), p.token, p.user?.display_name); return; }
+      if (p.status === 'expired') { process.stdout.write('\n'); die('授权码已过期，请重新运行 chenyu-pro login --web'); }
+    }
+    process.stdout.write('\n'); die('等待授权超时，请重试');
+    return;
+  }
+  const username = arg('username');
+  const password = arg('password');
+  if (!username || !password) die('用法: chenyu-pro login --web（浏览器授权，推荐）  或  chenyu-pro login --username <账号> --password <密码>');
+  const data = await api('/api/auth/login', { method: 'POST', auth: false, body: { identifier: username, password } });
+  await afterLogin(loadConfig(), data.token, data.user?.display_name || username);
 }
 
 async function cmdKey() {
@@ -329,8 +362,9 @@ function cmdVersion() {
 function cmdHelp() {
   console.log(`辰屿 Pro CLI v${VERSION} —— 剧本生产平台命令行
 
-  chenyu-pro key set <积分KEY> | key show                  绑定积分 KEY（绑定后平台自动免密登录）
-  chenyu-pro login --username <账号> --password <密码>     密码登录（没有 KEY 时才需要）
+  chenyu-pro login --web                                   网页授权登录你的账号（推荐；项目归你账号，KEY 自动带出）
+  chenyu-pro login --username <账号> --password <密码>     密码登录你的账号
+  chenyu-pro key set <积分KEY> | key show                  仅绑积分 KEY（快速免密，但走独立身份）
   chenyu-pro credits                                       查余额/冻结/累计消耗
   chenyu-pro estimate --episodes 30 [--model grok-4.5] [--director-cut]   预估消耗+余额校验
   chenyu-pro submit --mode rewrite --title <剧名> --episodes 30 \\

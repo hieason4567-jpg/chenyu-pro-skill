@@ -18,9 +18,12 @@ CLI 位置：本 Skill 目录 `scripts/chenyu_pro_cli.mjs`，安装器已创建 
 
 ## 标准工作流
 
-1. **确认授权**：`chenyu-pro credits`。报"未绑定 KEY"时向用户要积分 KEY（`key set`）。
-   **绑定 KEY 后平台自动免密登录，不需要单独 login**；只有没 KEY 的用户才需要账号
-   密码（`login`）。绝不把 KEY/密码写进回复或日志。
+1. **确认授权**：`chenyu-pro credits`。报未登录时，让用户选一种登录方式（账号才是身份，
+   KEY 是账号的属性，登录真账号会自动带出 KEY，项目也归属该网页账号）：
+   - **推荐 `chenyu-pro login --web`**：打开浏览器用自己账号点授权，命令行即以真账号登录。
+   - `chenyu-pro login --username <账号> --password <密码>`：密码登录同一真账号。
+   - `chenyu-pro key set <KEY>`：只绑 KEY 快速免密，但走独立身份（项目不进网页账号）。
+   绝不把 KEY/密码写进回复或日志。
 2. **收集需求**（缺什么问什么，别全问）：
    - 模式：洗稿（有源剧本）/ 网文改编（有小说）/ 原创
    - 洗稿必选目标市场：us_en/latam_es/brazil_pt/japan_ja/korea_ko/thailand_th/vietnam_vi/indonesia_id/cn_reskin
