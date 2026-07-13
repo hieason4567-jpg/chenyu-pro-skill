@@ -36,17 +36,53 @@ function saveConfig(cfg) {
 const mask = (v) => (v && v.length > 10 ? v.slice(0, 6) + '****' + v.slice(-4) : v ? '****' : '(未设置)');
 const die = (msg) => { console.error('✗ ' + msg); process.exit(1); };
 
-async function api(pathName, { method = 'GET', body, auth = true, base } = {}) {
+// KEY 免密登录：积分 KEY → H1 一次性 SSO 票据 → 平台 session。绑了 KEY 的
+// 用户不需要单独 chenyu-pro login；session 过期也走这里自动续登。
+async function ssoLoginWithKey() {
   const cfg = loadConfig();
+  const key = (cfg.credit_key || '').trim();
+  if (!key) return false;
+  try {
+    const tk = await fetch((cfg.credit_base || DEFAULT_CREDIT_BASE) + '/api/v1/sso/ticket', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' }
+    }).then((r) => r.json());
+    if (!tk?.ticket) return false;
+    const login = await fetch((cfg.platform_base || DEFAULT_PLATFORM) + '/api/auth/sso-login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticket: tk.ticket })
+    }).then((r) => r.json());
+    if (!login?.token) return false;
+    cfg.session_token = login.token;
+    cfg.username = login.user?.display_name || cfg.username || '';
+    saveConfig(cfg);
+    console.log('✓ 已用积分 KEY 自动登录平台: ' + (cfg.username || '(KEY 账号)'));
+    return true;
+  } catch { return false; }
+}
+
+async function api(pathName, { method = 'GET', body, auth = true, base, _retried = false } = {}) {
+  let cfg = loadConfig();
   const url = (base || cfg.platform_base || DEFAULT_PLATFORM) + pathName;
   const headers = { 'Content-Type': 'application/json' };
   if (auth) {
-    if (!cfg.session_token) die('未登录——先运行: chenyu-pro login --username <账号> --password <密码>');
+    if (!cfg.session_token) {
+      const ok = await ssoLoginWithKey();
+      if (!ok) die('未登录——绑定积分 KEY 后会自动免密登录（chenyu-pro key set <KEY>），或运行: chenyu-pro login --username <账号> --password <密码>');
+      cfg = loadConfig();
+    }
     headers.Authorization = 'Bearer ' + cfg.session_token;
   }
   const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401 && auth) die('登录已失效，请重新 chenyu-pro login');
+  if (res.status === 401 && auth) {
+    // session 过期：用 KEY 自动续登一次再重试，仍不行才要求人工登录
+    if (!_retried && await ssoLoginWithKey()) {
+      return api(pathName, { method, body, auth, base, _retried: true });
+    }
+    die('登录已失效——绑定了 KEY 会自动续登（刚已尝试失败），请检查 KEY 或重新 chenyu-pro login');
+  }
   if (!res.ok || data.ok === false || data.success === false) die(`${pathName} 失败(${res.status}): ${data.error || JSON.stringify(data).slice(0, 200)}`);
   return data;
 }
@@ -246,8 +282,8 @@ async function cmdProjects() {
 function cmdHelp() {
   console.log(`辰屿 Pro CLI —— 剧本生产平台命令行
 
-  chenyu-pro login --username <账号> --password <密码>     登录平台（session 存本地）
-  chenyu-pro key set <积分KEY> | key show                  绑定/查看积分 KEY（掩码）
+  chenyu-pro key set <积分KEY> | key show                  绑定积分 KEY（绑定后平台自动免密登录）
+  chenyu-pro login --username <账号> --password <密码>     密码登录（没有 KEY 时才需要）
   chenyu-pro credits                                       查余额/冻结/累计消耗
   chenyu-pro estimate --episodes 30 [--model grok-4.5] [--director-cut]   预估消耗+余额校验
   chenyu-pro submit --mode rewrite --title <剧名> --episodes 30 \\

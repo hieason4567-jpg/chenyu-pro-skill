@@ -18,8 +18,9 @@ CLI 位置：本 Skill 目录 `scripts/chenyu_pro_cli.mjs`，安装器已创建 
 
 ## 标准工作流
 
-1. **确认授权**：`chenyu-pro credits`。报"未登录/未绑定 KEY"时向用户要账号密码
-   （`login`）与积分 KEY（`key set`）。绝不把 KEY/密码写进回复或日志。
+1. **确认授权**：`chenyu-pro credits`。报"未绑定 KEY"时向用户要积分 KEY（`key set`）。
+   **绑定 KEY 后平台自动免密登录，不需要单独 login**；只有没 KEY 的用户才需要账号
+   密码（`login`）。绝不把 KEY/密码写进回复或日志。
 2. **收集需求**（缺什么问什么，别全问）：
    - 模式：洗稿（有源剧本）/ 网文改编（有小说）/ 原创
    - 洗稿必选目标市场：us_en/latam_es/brazil_pt/japan_ja/korea_ko/thailand_th/vietnam_vi/indonesia_id/cn_reskin
@@ -38,7 +39,8 @@ CLI 位置：本 Skill 目录 `scripts/chenyu_pro_cli.mjs`，安装器已创建 
 
 ## 异常处置
 
-- `login 失败/401`：让用户核对账号密码；session 过期就重新 login。
+- `401/登录失效`：CLI 会先用 KEY 自动续登再重试，仍失败才需要人工处理——先
+  `chenyu-pro key show` 核对 KEY，再考虑账号密码 login。
 - `submit 报源文本太短`：源文件不足 100 字，让用户确认文件。
 - `status 长时间卡同一步骤(>15分钟)`：平台有 Watchdog 自动恢复，先等；仍卡则报告用户。
 - 生成中途 `failed`：把 status 显示的错误原样告诉用户，不要自己编原因。
