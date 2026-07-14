@@ -8,6 +8,7 @@ import os from 'node:os';
 import { exec } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.3.1 2026-07-14  credits 精简为一行（用户名 · 余额），去掉冻结/累计/集数估算
 // v1.3.0 2026-07-13  新增 login --web 网页授权：浏览器登录真账号后授权命令行，
 //                    CLI 以你的账号登录(项目归网页账号, KEY 作为账号属性自动跟过来)
 // v1.2.0 2026-07-13  新增 sync 命令: 成品剧本同步到云端脚本库, 辰屿客户端可下载
@@ -15,7 +16,7 @@ import { exec } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.3.0';
+const VERSION = '1.3.1';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -177,10 +178,9 @@ async function cmdKey() {
 async function cmdCredits() {
   const data = await creditApi('/api/jimeng/v1/key');
   const k = data.key || {};
-  console.log(`KEY: ${k.name || ''} (${k.keyMasked || ''})`);
-  console.log(`余额: ${k.pointsBalance ?? '?'} 分 | 冻结: ${k.pointsReserved ?? 0} | 累计消耗: ${k.pointsSpent ?? 0}`);
-  const perEp = COST_PER_EPISODE.auto;
-  if (Number.isFinite(k.pointsBalance)) console.log(`≈ 还能生成 ${Math.floor(k.pointsBalance / perEp)} 集（默认模型口径）`);
+  const cfg = loadConfig();
+  const who = cfg.username || k.name || '账号';
+  console.log(`${who} · 余额 ${k.pointsBalance ?? '?'} 分`);
 }
 
 async function cmdEstimate() {
