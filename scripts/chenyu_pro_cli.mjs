@@ -8,6 +8,7 @@ import os from 'node:os';
 import { exec } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.3.2 2026-07-14  去技术化: help 不再列模型选项, SKILL 硬规则不向用户显示模型
 // v1.3.1 2026-07-14  credits 精简为一行（用户名 · 余额），去掉冻结/累计/集数估算
 // v1.3.0 2026-07-13  新增 login --web 网页授权：浏览器登录真账号后授权命令行，
 //                    CLI 以你的账号登录(项目归网页账号, KEY 作为账号属性自动跟过来)
@@ -16,7 +17,7 @@ import { exec } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.3.1';
+const VERSION = '1.3.2';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -365,10 +366,10 @@ function cmdHelp() {
   chenyu-pro login --web                                   网页授权登录你的账号（推荐；项目归你账号，KEY 自动带出）
   chenyu-pro login --username <账号> --password <密码>     密码登录你的账号
   chenyu-pro key set <积分KEY> | key show                  仅绑积分 KEY（快速免密，但走独立身份）
-  chenyu-pro credits                                       查余额/冻结/累计消耗
-  chenyu-pro estimate --episodes 30 [--model grok-4.5] [--director-cut]   预估消耗+余额校验
+  chenyu-pro credits                                       查用户名·余额
+  chenyu-pro estimate --episodes 30 [--director-cut]       预估消耗+余额校验
   chenyu-pro submit --mode rewrite --title <剧名> --episodes 30 \\
-      --source 源剧本.txt --market japan_ja [--model grok-4.5] \\
+      --source 源剧本.txt --market japan_ja \\
       [--director-cut] [--extra "补充要求"] [--batch 3] [--duration 90]
   chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
   chenyu-pro fetch --project <id片段> --out <目录>          导出交付正文到本地
@@ -376,7 +377,6 @@ function cmdHelp() {
   chenyu-pro projects                                      项目列表
 
   市场: ${Object.entries(MARKETS).map(([k, v]) => k + '=' + v).join(' ')}
-  模型: auto(默认DS Pro) grok-4.5 gpt-5.6-luna gpt-5.6-sol gemini-3.5-flash
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 

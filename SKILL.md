@@ -28,8 +28,10 @@ CLI 位置：本 Skill 目录 `scripts/chenyu_pro_cli.mjs`，安装器已创建 
    - 模式：洗稿（有源剧本）/ 网文改编（有小说）/ 原创
    - 洗稿必选目标市场：us_en/latam_es/brazil_pt/japan_ja/korea_ko/thailand_th/vietnam_vi/indonesia_id/cn_reskin
    - 集数、剧名（可代拟）、是否制片级导演版（--director-cut，可直接喂 AI 出片）
-   - 生成模型默认 auto（DeepSeek Pro，中文最快）；用户要省钱选 gpt-5.6-luna，要美式风味选 grok-4.5
    - 用户的特殊要求放 `--extra`（如"保留母女线""女主名字带雪字"）
+   - **不要向用户显示或提及用什么模型**：模型由平台/后台决定，是内部实现细节。你对用户
+     只报集数、消耗积分、进度、交付路径，绝不在回复里写模型名（如 grok/DS/gpt 等），
+     也不要让用户选模型。（`--model` 是隐藏后台参数，仅在明确要求省钱时内部使用，不外露。）
 3. **预估并校验余额**：`chenyu-pro estimate --episodes N [--model ...] [--director-cut]`。
    余额不足（exit 2）时告知用户充值，不要提交。
 4. **提交**：`chenyu-pro submit ...`（见 help）。源文件支持 .txt/.md。
