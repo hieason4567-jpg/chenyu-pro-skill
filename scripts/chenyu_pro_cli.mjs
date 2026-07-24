@@ -8,6 +8,9 @@ import os from 'node:os';
 import { exec, spawn, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.8.2 2026-07-14  修严重bug: --extra(洗稿指令)误当视频分析prompt传入,导致视频模型
+//                    照洗稿指令分析(柚子被分析成西瓜),污染忠实反推。改为 extra 只进洗稿,
+//                    视频分析纯忠实; 真需分析指引用 --analysis-note
 // v1.8.1 2026-07-14  status 多读 /jobs 显示后台任务进度(反推/生成 running X%),修 video
 //                    模式项目状态恒 draft 误判卡住; --watch 按 job 终态停
 // v1.8.0 2026-07-14  上传前自动压到480p(有ffmpeg时,保留音轨,与服务端分析代理一致)
@@ -30,7 +33,7 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.8.1';
+const VERSION = '1.8.2';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -415,7 +418,11 @@ async function cmdSubmitVideo() {
     videos.push({ client_media_path: u.client_media_path, episode_id: String(urls.length + i + 1).padStart(3, '0'), title: u.title, mime_type: u.mime_type, size_bytes: u.size_bytes });
   });
   console.log(`✓ 全部 ${videos.length} 个视频就绪，开始反推…`);
-  await api(`/api/projects/${pid}/video-reverse/start`, { method: 'POST', body: { videos, auto_start_workflow: true, ...(extra ? { prompt: extra } : {}) } });
+  // 注意：--extra 是洗稿指令，只能进 auto_rewrite，绝不能当视频分析 prompt——否则
+  // 视频模型会照着洗稿指令"分析"(如把画面里的柚子直接分析成西瓜)，污染忠实反推。
+  // 视频分析要忠实描述原视频；真需要分析指引用 --analysis-note（默认空=纯忠实反推）。
+  const analysisNote = arg('analysis-note', '');
+  await api(`/api/projects/${pid}/video-reverse/start`, { method: 'POST', body: { videos, auto_start_workflow: true, ...(analysisNote ? { prompt: analysisNote } : {}) } });
   entry.started = true; saveVideoManifest(manifest);
   if (market) console.log(`✓ 已开始反推，完成后自动洗成《${MARKETS[market]}》剧本（时长跟随源视频，${count} 集）`);
   else console.log('✓ 已开始反推成剧本稿（未选 --market，不自动洗稿；反推稿可在网页「剧本洗稿·选历史项目」里用）');
