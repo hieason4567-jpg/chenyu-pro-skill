@@ -8,6 +8,8 @@ import os from 'node:os';
 import { exec } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.4.0 2026-07-14  新增 continue 命令(首批暂停后续跑全量不重扣) + SKILL 硬规则
+//                    绝不自己写剧本(换对话也先 projects 找项目 continue，不代写)
 // v1.3.2 2026-07-14  去技术化: help 不再列模型选项, SKILL 硬规则不向用户显示模型
 // v1.3.1 2026-07-14  credits 精简为一行（用户名 · 余额），去掉冻结/累计/集数估算
 // v1.3.0 2026-07-13  新增 login --web 网页授权：浏览器登录真账号后授权命令行，
@@ -17,7 +19,7 @@ import { exec } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.3.2';
+const VERSION = '1.4.0';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -292,6 +294,27 @@ async function cmdStatus() {
   }
 }
 
+// 续跑已暂停的项目（首批完成后平台会 paused 等确认）。走平台 start-auto 从
+// 已完成集之后继续，绝不重扣已生成的集，也绝不该由你手写后续集。默认续下一批，
+// --full 一次跑完剩余全部。这是"首批满意→继续全量"的正确路径。
+async function cmdContinue() {
+  const fragment = arg('project') || die('缺 --project <id片段或剧名>');
+  const p = await findProject(fragment);
+  const done = Number(p.completed_episodes || 0);
+  const total = Number(p.total_episodes || 0);
+  if (['running', 'processing', 'queued'].includes(String(p.status))) {
+    console.log(`《${p.title}》正在跑（${p.status}，${done}/${total}），无需重复触发。用 status --watch 盯进度。`);
+    return;
+  }
+  if (total && done >= total) { console.log(`《${p.title}》已全部完成 ${done}/${total}，无需继续。用 fetch 取稿。`); return; }
+  const remaining = total ? total - done : 0;
+  const body = flag('full') && remaining > 0 ? { episode_count: remaining } : {};
+  await api(`/api/projects/${p.id}/workflow/start-auto`, { method: 'POST', body });
+  const scope = flag('full') && remaining > 0 ? `剩余全部 ${remaining} 集` : '下一批';
+  console.log(`✓ 已继续《${p.title}》：从第 ${done + 1} 集起（${scope}）。用 status --watch 盯进度，完成后 fetch 取稿。`);
+  if (flag('watch')) { process.argv.push('--project', fragment, '--watch'); await cmdStatus(); }
+}
+
 async function cmdFetch() {
   const fragment = arg('project') || die('缺 --project');
   const outDir = path.resolve(arg('out', './chenyu-pro-output'));
@@ -372,6 +395,7 @@ function cmdHelp() {
       --source 源剧本.txt --market japan_ja \\
       [--director-cut] [--extra "补充要求"] [--batch 3] [--duration 90]
   chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
+  chenyu-pro continue --project <id片段|剧名> [--full] [--watch]  首批暂停后继续全量(不重扣)
   chenyu-pro fetch --project <id片段> --out <目录>          导出交付正文到本地
   chenyu-pro sync --project <id片段|剧名>                   同步到云端脚本库（辰屿客户端可下载）
   chenyu-pro projects                                      项目列表
@@ -380,5 +404,5 @@ function cmdHelp() {
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, estimate: cmdEstimate, submit: cmdSubmit, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, estimate: cmdEstimate, submit: cmdSubmit, status: cmdStatus, continue: cmdContinue, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 await (commands[cmd] || cmdHelp)();
