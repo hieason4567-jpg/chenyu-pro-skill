@@ -8,6 +8,9 @@ import os from 'node:os';
 import { exec, spawn, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.8.3 2026-07-24  修压缩静默失败: resolveFfmpeg 探测 -encoders,优先选带 libx264 的
+//                    ffmpeg(GPU-only 构建无 libx264 → "Unknown encoder" → 全部回退传原片)。
+//                    都无 libx264 才退 nvenc/qsv/amf/mpeg4; 多加 BOTV 完整版为候选。
 // v1.8.2 2026-07-14  修严重bug: --extra(洗稿指令)误当视频分析prompt传入,导致视频模型
 //                    照洗稿指令分析(柚子被分析成西瓜),污染忠实反推。改为 extra 只进洗稿,
 //                    视频分析纯忠实; 真需分析指引用 --analysis-note
@@ -33,7 +36,7 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.8.2';
+const VERSION = '1.8.3';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -73,19 +76,34 @@ function hashKey(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h <
 
 // 上传前压缩：服务端反推只用低清分析代理(scale=-2:480)，原片纯浪费带宽。
 // 有 ffmpeg 就先压到 480p（保留音轨供对白识别），上传小一个数量级；没有则传原片。
+// 关键：优先选带 libx264 的 ffmpeg。GPU-only 构建(只有 h264_amf/nvenc)没有 libx264，
+// 硬调 -c:v libx264 会报 "Unknown encoder 'libx264'" → 压缩失败静默传几十 MB 原片。
+// 探测每个候选的 -encoders：带 libx264 的直接用；都没有才退到可用的 GPU/软编码器。
+// 返回 {bin, vcodec, vargs} 或 null。
 function resolveFfmpeg() {
-  const cands = [process.env.CHENYU_FFMPEG, 'ffmpeg', 'C:\\ffmpeg\\bin\\ffmpeg.exe', 'C:\\ffmpeg-6.1.1\\bin\\ffmpeg.exe'].filter(Boolean);
+  const cands = [process.env.CHENYU_FFMPEG, 'ffmpeg', 'C:\\ffmpeg\\bin\\ffmpeg.exe', 'C:\\ffmpeg-6.1.1\\bin\\ffmpeg.exe', 'E:\\pump2.0\\BOTV\\FFMPEG.EXE'].filter(Boolean);
+  let firstBin = null, firstEnc = '';
   for (const c of cands) {
-    try { const r = spawnSync(c, ['-version'], { windowsHide: true }); if (r.status === 0) return c; } catch { /* 下一个 */ }
+    let enc;
+    try { const r = spawnSync(c, ['-hide_banner', '-encoders'], { windowsHide: true, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }); if (r.status !== 0) continue; enc = String(r.stdout || ''); } catch { continue; }
+    if (!firstBin) { firstBin = c; firstEnc = enc; }
+    if (/\blibx264\b/.test(enc)) return { bin: c, vcodec: 'libx264', vargs: ['-preset', 'veryfast', '-crf', '28'] };
   }
-  return null;
+  if (!firstBin) return null;
+  const has = (n) => new RegExp('\\b' + n + '\\b').test(firstEnc);
+  if (has('h264_nvenc')) return { bin: firstBin, vcodec: 'h264_nvenc', vargs: ['-rc', 'vbr', '-cq', '30'] };
+  if (has('h264_qsv')) return { bin: firstBin, vcodec: 'h264_qsv', vargs: ['-global_quality', '30'] };
+  if (has('h264_amf')) return { bin: firstBin, vcodec: 'h264_amf', vargs: ['-rc', 'cqp', '-qp_i', '30', '-qp_p', '30', '-qp_b', '30'] };
+  if (has('mpeg4')) return { bin: firstBin, vcodec: 'mpeg4', vargs: ['-q:v', '5'] };
+  return { bin: firstBin, vcodec: 'libx264', vargs: ['-preset', 'veryfast', '-crf', '28'] };
 }
-function compressVideoProxy(ffmpeg, src, dst, height) {
+function compressVideoProxy(ff, src, dst, height) {
   return new Promise((resolve, reject) => {
     try { fs.rmSync(dst, { force: true }); } catch { /* ignore */ }
     // 视觉降到 height，保留音轨(AAC 96k)；与服务端分析代理对齐，分析零损失。
-    const a = ['-y', '-i', src, '-vf', `scale=-2:${height}`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', dst];
-    const child = spawn(ffmpeg, a, { windowsHide: true });
+    // 编码器由 resolveFfmpeg 探测选定(优先 libx264，GPU-only 环境退 nvenc/qsv/amf)。
+    const a = ['-y', '-i', src, '-vf', `scale=-2:${height}`, '-c:v', ff.vcodec, ...ff.vargs, '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', dst];
+    const child = spawn(ff.bin, a, { windowsHide: true });
     let err = '';
     child.stderr?.on('data', (d) => { err += d.toString(); if (err.length > 4000) err = err.slice(-4000); });
     child.on('error', reject);
@@ -379,6 +397,7 @@ async function cmdSubmitVideo() {
   const proxyH = Math.max(240, Number(arg('proxy-height', '480')) || 480);
   const ffmpeg = flag('no-compress') ? null : resolveFfmpeg();
   if (files.length && !ffmpeg && !flag('no-compress')) console.log(`  提示: 未找到 ffmpeg → 上传原始视频(慢)。装 ffmpeg 后会自动压到 ${proxyH}p 再传(小一个数量级，快很多)。`);
+  else if (files.length && ffmpeg && ffmpeg.vcodec !== 'libx264') console.log(`  提示: 当前 ffmpeg 无 libx264，改用 ${ffmpeg.vcodec} 压缩(仍压到 ${proxyH}p)。想要更稳可装带 libx264 的完整版或设 CHENYU_FFMPEG 指向它。`);
   // 本地文件批量上传（跳过已传，传一个立即落盘清单 → 可断点续传）
   let done = 0;
   for (let i = 0; i < files.length; i++) {
