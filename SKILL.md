@@ -61,9 +61,12 @@ CLI 位置：本 Skill 目录 `scripts/chenyu_pro_cli.mjs`，安装器已创建 
 4. **提交**：`chenyu-pro submit ...`（见 help）。源文件支持 .txt/.md。
 5. **盯进度**：`chenyu-pro status --project <id> --watch`（后台跑）。平台自带断点自愈。
    首批集数默认 3——首批完成后平台会 `paused` 等确认。把首批 fetch 给用户过目。
-   - 用户说满意/继续/写完剩下的 → **你自己跑 `chenyu-pro continue --project <id> --full`**
-     续跑剩余全部（从已完成集之后，不重扣已生成的集），用户不用碰任何命令。**不要重新
-     submit（会重复扣费），更不要自己写后续集，也不要让用户去点网页/敲命令。**
+   - 用户说满意/继续/写完剩下的 → **你自己跑 `chenyu-pro continue`**（从已完成集之后续跑，
+     不重扣已生成的集），用户不用碰任何命令。范围按用户口气定：
+     - "继续/再跑几集" → 默认 `chenyu-pro continue --project <id>`（下一批，平台默认 3 集）
+     - "再写 5 集/续 5 集" → `chenyu-pro continue --project <id> --episodes 5`
+     - "写完剩下的/全部续完" → `chenyu-pro continue --project <id> --full`
+     **不要重新 submit（会重复扣费），更不要自己写后续集，也不要让用户去点网页/敲命令。**
    - `paused` 且提示积分不足 → 告诉用户充值，充好后你再自己 `chenyu-pro continue`。
 6. **交付**：`chenyu-pro fetch --project <id> --out <目录>`，把目录位置告诉用户
    （逐集 txt + 全剧合并.txt）。
