@@ -5,9 +5,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { exec } from 'node:child_process';
+import { exec, spawn, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.8.0 2026-07-14  上传前自动压到480p(有ffmpeg时,保留音轨,与服务端分析代理一致)
+//                    ——反推只用低清代理,上传体积小一个数量级;--no-compress 关
 // v1.7.0 2026-07-14  视频反推本地批量上传断点续传(传一个存一个,中断重跑同命令
 //                    跳过已传只补未传), 解决大批量(几十集)上传被窗口杀后重传整季
 // v1.6.0 2026-07-14  视频反推支持 --video-file 本地文件批量上传(走平台 signed-upload
@@ -26,7 +28,7 @@ import { exec } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.7.0';
+const VERSION = '1.8.0';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -63,6 +65,28 @@ const VIDEO_MANIFEST = path.join(CONFIG_DIR, 'video-uploads.json');
 function loadVideoManifest() { try { return JSON.parse(fs.readFileSync(VIDEO_MANIFEST, 'utf8')); } catch { return {}; } }
 function saveVideoManifest(m) { fs.mkdirSync(CONFIG_DIR, { recursive: true }); fs.writeFileSync(VIDEO_MANIFEST, JSON.stringify(m, null, 2), 'utf8'); }
 function hashKey(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; return h.toString(36); }
+
+// 上传前压缩：服务端反推只用低清分析代理(scale=-2:480)，原片纯浪费带宽。
+// 有 ffmpeg 就先压到 480p（保留音轨供对白识别），上传小一个数量级；没有则传原片。
+function resolveFfmpeg() {
+  const cands = [process.env.CHENYU_FFMPEG, 'ffmpeg', 'C:\\ffmpeg\\bin\\ffmpeg.exe', 'C:\\ffmpeg-6.1.1\\bin\\ffmpeg.exe'].filter(Boolean);
+  for (const c of cands) {
+    try { const r = spawnSync(c, ['-version'], { windowsHide: true }); if (r.status === 0) return c; } catch { /* 下一个 */ }
+  }
+  return null;
+}
+function compressVideoProxy(ffmpeg, src, dst, height) {
+  return new Promise((resolve, reject) => {
+    try { fs.rmSync(dst, { force: true }); } catch { /* ignore */ }
+    // 视觉降到 height，保留音轨(AAC 96k)；与服务端分析代理对齐，分析零损失。
+    const a = ['-y', '-i', src, '-vf', `scale=-2:${height}`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', dst];
+    const child = spawn(ffmpeg, a, { windowsHide: true });
+    let err = '';
+    child.stderr?.on('data', (d) => { err += d.toString(); if (err.length > 4000) err = err.slice(-4000); });
+    child.on('error', reject);
+    child.on('close', (s) => { (s === 0 && fs.existsSync(dst)) ? resolve() : reject(new Error(`ffmpeg 压缩失败(${s})`)); });
+  });
+}
 
 // KEY 免密登录：积分 KEY → H1 一次性 SSO 票据 → 平台 session。绑了 KEY 的
 // 用户不需要单独 chenyu-pro login；session 过期也走这里自动续登。
@@ -346,22 +370,38 @@ async function cmdSubmitVideo() {
     console.log(`✓ 反推项目已创建: ${pid}（共 ${count} 个：${urls.length} 链接 + ${files.length} 本地文件）`);
   }
   entry.uploaded = entry.uploaded || {};
+  // 上传前压缩到分析代理分辨率（与服务端反推一致），大幅缩短上传时间；--no-compress 关闭。
+  const proxyH = Math.max(240, Number(arg('proxy-height', '480')) || 480);
+  const ffmpeg = flag('no-compress') ? null : resolveFfmpeg();
+  if (files.length && !ffmpeg && !flag('no-compress')) console.log(`  提示: 未找到 ffmpeg → 上传原始视频(慢)。装 ffmpeg 后会自动压到 ${proxyH}p 再传(小一个数量级，快很多)。`);
   // 本地文件批量上传（跳过已传，传一个立即落盘清单 → 可断点续传）
   let done = 0;
   for (let i = 0; i < files.length; i++) {
     const fp = files[i];
     const name = path.basename(fp);
-    const size = fs.statSync(fp).size;
+    const origSize = fs.statSync(fp).size;
     if (entry.uploaded[fp] && entry.uploaded[fp].client_media_path) { done++; continue; }
-    const mime = guessVideoMime(name);
-    process.stdout.write(`  上传 ${i + 1}/${files.length}：${name}（${(size / 1048576).toFixed(1)}MB）… `);
-    const signed = await api(`/api/projects/${pid}/client-media/signed-upload`, { method: 'POST', body: { kind: 'video', filename: name, mimeType: mime, size } });
+    let uploadPath = fp, uploadName = name, uploadMime = guessVideoMime(name), tmp = null;
+    if (ffmpeg) {
+      tmp = path.join(os.tmpdir(), `chenyu-proxy-${process.pid}-${i}.mp4`);
+      process.stdout.write(`  压缩 ${i + 1}/${files.length}：${name}（${(origSize / 1048576).toFixed(1)}MB→${proxyH}p）… `);
+      try {
+        await compressVideoProxy(ffmpeg, fp, tmp, proxyH);
+        uploadPath = tmp; uploadName = name.replace(/\.[^.]+$/, '') + `_${proxyH}p.mp4`; uploadMime = 'video/mp4';
+        process.stdout.write(`${(fs.statSync(tmp).size / 1048576).toFixed(1)}MB → 上传… `);
+      } catch { try { fs.rmSync(tmp, { force: true }); } catch { /* */ } tmp = null; uploadPath = fp; process.stdout.write('压缩失败，传原片… '); }
+    } else {
+      process.stdout.write(`  上传 ${i + 1}/${files.length}：${name}（${(origSize / 1048576).toFixed(1)}MB）… `);
+    }
+    const upSize = fs.statSync(uploadPath).size;
+    const signed = await api(`/api/projects/${pid}/client-media/signed-upload`, { method: 'POST', body: { kind: 'video', filename: uploadName, mimeType: uploadMime, size: upSize } });
     const uploadUrl = signed.upload?.uploadUrl || signed.uploadUrl;
     const mediaPath = signed.upload?.path || signed.path;
-    if (!uploadUrl || !mediaPath) die('获取视频上传地址失败');
-    const put = await fetch(uploadUrl, { method: 'PUT', body: fs.readFileSync(fp), headers: { 'Content-Type': mime } });
+    if (!uploadUrl || !mediaPath) { if (tmp) try { fs.rmSync(tmp, { force: true }); } catch { /* */ } die('获取视频上传地址失败'); }
+    const put = await fetch(uploadUrl, { method: 'PUT', body: fs.readFileSync(uploadPath), headers: { 'Content-Type': uploadMime } });
+    if (tmp) try { fs.rmSync(tmp, { force: true }); } catch { /* */ }
     if (!put.ok) die(`视频上传失败（HTTP ${put.status}）：${name}`);
-    entry.uploaded[fp] = { client_media_path: mediaPath, title: name, mime_type: mime, size_bytes: size };
+    entry.uploaded[fp] = { client_media_path: mediaPath, title: name, mime_type: uploadMime, size_bytes: upSize };
     saveVideoManifest(manifest);
     done++;
     console.log(`✓ (${done}/${files.length})`);
@@ -513,6 +553,7 @@ function cmdHelp() {
   chenyu-pro submit --mode video (--video-url <链接> | --video-file <本地.mp4>) [--market us_en] \\
       视频反推洗稿：反推成剧本稿；带 --market 反推完自动洗稿(时长跟源视频)
       --video-url 链接 / --video-file 本地文件(自动上传R2)；多个逗号分隔，可混用
+      本地文件有 ffmpeg 时自动压到 480p 再传(反推只用低清代理，快一个数量级；--no-compress 关)
       大批量本地文件支持断点续传：中断后重跑同一条命令，自动跳过已传、只补未传
   chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
   chenyu-pro continue --project <id片段|剧名> [--episodes N|--full] [--watch]  续跑(不重扣):
