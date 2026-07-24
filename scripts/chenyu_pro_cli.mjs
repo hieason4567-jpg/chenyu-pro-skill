@@ -8,6 +8,8 @@ import os from 'node:os';
 import { exec, spawn, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.8.4 2026-07-24  视频上传改有界并发(默认4路,压缩吃CPU+上传吃网络重叠,比串行快2-3倍);
+//                    --concurrency N 调, =1 退回串行。断点续传/清单落盘不变。
 // v1.8.3 2026-07-24  修压缩静默失败: resolveFfmpeg 探测 -encoders,优先选带 libx264 的
 //                    ffmpeg(GPU-only 构建无 libx264 → "Unknown encoder" → 全部回退传原片)。
 //                    都无 libx264 才退 nvenc/qsv/amf/mpeg4; 多加 BOTV 完整版为候选。
@@ -36,7 +38,7 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.8.3';
+const VERSION = '1.8.4';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -398,24 +400,26 @@ async function cmdSubmitVideo() {
   const ffmpeg = flag('no-compress') ? null : resolveFfmpeg();
   if (files.length && !ffmpeg && !flag('no-compress')) console.log(`  提示: 未找到 ffmpeg → 上传原始视频(慢)。装 ffmpeg 后会自动压到 ${proxyH}p 再传(小一个数量级，快很多)。`);
   else if (files.length && ffmpeg && ffmpeg.vcodec !== 'libx264') console.log(`  提示: 当前 ffmpeg 无 libx264，改用 ${ffmpeg.vcodec} 压缩(仍压到 ${proxyH}p)。想要更稳可装带 libx264 的完整版或设 CHENYU_FFMPEG 指向它。`);
-  // 本地文件批量上传（跳过已传，传一个立即落盘清单 → 可断点续传）
-  let done = 0;
-  for (let i = 0; i < files.length; i++) {
+  // 本地文件批量上传：有界并发（压缩吃 CPU、上传吃网络，重叠起来比一条条串行快 2-3 倍）。
+  // 传一个立即落盘清单 → 可断点续传；--concurrency N 调并发(默认 4)，--concurrency 1 退回串行。
+  const CONC = Math.max(1, Math.min(8, Number(arg('concurrency', '4')) || 4));
+  let done = 0, nextIdx = 0;
+  const total = files.length;
+  const already = files.filter((fp) => entry.uploaded[fp] && entry.uploaded[fp].client_media_path).length;
+  if (total) console.log(`  开始上传 ${total} 个（并发 ${CONC}${already ? `，跳过已传 ${already}` : ''}）…`);
+  async function uploadOne(i) {
     const fp = files[i];
     const name = path.basename(fp);
+    if (entry.uploaded[fp] && entry.uploaded[fp].client_media_path) { done++; return; }
     const origSize = fs.statSync(fp).size;
-    if (entry.uploaded[fp] && entry.uploaded[fp].client_media_path) { done++; continue; }
-    let uploadPath = fp, uploadName = name, uploadMime = guessVideoMime(name), tmp = null;
+    let uploadPath = fp, uploadName = name, uploadMime = guessVideoMime(name), tmp = null, note = `${(origSize / 1048576).toFixed(1)}MB 原片`;
     if (ffmpeg) {
       tmp = path.join(os.tmpdir(), `chenyu-proxy-${process.pid}-${i}.mp4`);
-      process.stdout.write(`  压缩 ${i + 1}/${files.length}：${name}（${(origSize / 1048576).toFixed(1)}MB→${proxyH}p）… `);
       try {
         await compressVideoProxy(ffmpeg, fp, tmp, proxyH);
         uploadPath = tmp; uploadName = name.replace(/\.[^.]+$/, '') + `_${proxyH}p.mp4`; uploadMime = 'video/mp4';
-        process.stdout.write(`${(fs.statSync(tmp).size / 1048576).toFixed(1)}MB → 上传… `);
-      } catch { try { fs.rmSync(tmp, { force: true }); } catch { /* */ } tmp = null; uploadPath = fp; process.stdout.write('压缩失败，传原片… '); }
-    } else {
-      process.stdout.write(`  上传 ${i + 1}/${files.length}：${name}（${(origSize / 1048576).toFixed(1)}MB）… `);
+        note = `${(origSize / 1048576).toFixed(1)}MB→${(fs.statSync(tmp).size / 1048576).toFixed(1)}MB`;
+      } catch { try { fs.rmSync(tmp, { force: true }); } catch { /* */ } tmp = null; uploadPath = fp; note = `${(origSize / 1048576).toFixed(1)}MB 原片(压缩失败)`; }
     }
     const upSize = fs.statSync(uploadPath).size;
     const signed = await api(`/api/projects/${pid}/client-media/signed-upload`, { method: 'POST', body: { kind: 'video', filename: uploadName, mimeType: uploadMime, size: upSize } });
@@ -426,10 +430,14 @@ async function cmdSubmitVideo() {
     if (tmp) try { fs.rmSync(tmp, { force: true }); } catch { /* */ }
     if (!put.ok) die(`视频上传失败（HTTP ${put.status}）：${name}`);
     entry.uploaded[fp] = { client_media_path: mediaPath, title: name, mime_type: uploadMime, size_bytes: upSize };
-    saveVideoManifest(manifest);
+    saveVideoManifest(manifest); // Node 单线程，writeFileSync 原子；并发 worker 共享同一 manifest 对象
     done++;
-    console.log(`✓ (${done}/${files.length})`);
+    console.log(`  ✓ ${done}/${total}  ${name}  ${note}`);
   }
+  // 有界并发池：CONC 个 worker 抢 nextIdx，抢完即止
+  await Promise.all(Array.from({ length: Math.min(CONC, total || 1) }, async () => {
+    for (let i = nextIdx++; i < total; i = nextIdx++) await uploadOne(i);
+  }));
   // 组 videos：URL 在前，本地文件按原顺序在后
   const videos = urls.map((u, i) => ({ video_url: u, episode_id: String(i + 1).padStart(3, '0') }));
   files.forEach((fp, i) => {
