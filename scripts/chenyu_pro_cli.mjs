@@ -8,6 +8,8 @@ import os from 'node:os';
 import { exec, spawn, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.8.1 2026-07-14  status 多读 /jobs 显示后台任务进度(反推/生成 running X%),修 video
+//                    模式项目状态恒 draft 误判卡住; --watch 按 job 终态停
 // v1.8.0 2026-07-14  上传前自动压到480p(有ffmpeg时,保留音轨,与服务端分析代理一致)
 //                    ——反推只用低清代理,上传体积小一个数量级;--no-compress 关
 // v1.7.0 2026-07-14  视频反推本地批量上传断点续传(传一个存一个,中断重跑同命令
@@ -28,7 +30,7 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.8.0';
+const VERSION = '1.8.1';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -433,9 +435,25 @@ async function cmdStatus() {
   const watch = flag('watch');
   for (;;) {
     const p = await findProject(fragment);
-    const line = `[${new Date().toLocaleTimeString()}] ${p.title} | 状态:${p.status} | 步骤:${p.current_step || '-'} | 集:${p.current_episode || '-'} | 完成:${p.completed_episodes ?? 0}/${p.total_episodes}`;
-    console.log(line);
-    if (!watch || ['completed', 'failed'].includes(String(p.status))) break;
+    // 关键：video_reverse 等模式下 project.status 一直停在 draft，真进度在后台 job 里。
+    // 多调一次 /jobs 显示后台任务的 running/进度/消息（如“反推分析 EP6/53”），并据此判终止。
+    let jobLine = '', jobTerminal = false;
+    try {
+      const jobs = (await api(`/api/projects/${p.id}/jobs`)).jobs || [];
+      const active = jobs.find((j) => ['running', 'processing', 'queued', 'pending'].includes(String(j.status))) || jobs[0];
+      if (active) {
+        const st = String(active.status || '');
+        jobTerminal = ['completed', 'failed', 'cancelled'].includes(st);
+        const prog = (active.progress != null && active.progress !== '') ? ` ${active.progress}%` : '';
+        const msg = String(active.message || active.error || '').replace(/\s+/g, ' ').trim().slice(0, 76);
+        jobLine = ` | 后台:${st}${prog}${msg ? ' ' + msg : ''}`;
+      }
+    } catch { /* /jobs 可选，失败不影响主状态 */ }
+    console.log(`[${new Date().toLocaleTimeString()}] ${p.title} | 状态:${p.status} | 步骤:${p.current_step || '-'} | 完成:${p.completed_episodes ?? 0}/${p.total_episodes}${jobLine}`);
+    if (!watch || ['completed', 'failed'].includes(String(p.status)) || jobTerminal) {
+      if (jobTerminal && String(p.mode) === 'video_reverse') console.log('  反推任务已结束。若提交时选了市场，洗稿项目已自动创建 → 用 chenyu-pro projects 查看。');
+      break;
+    }
     await new Promise((r) => setTimeout(r, 30000));
   }
 }
