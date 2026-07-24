@@ -8,6 +8,8 @@ import os from 'node:os';
 import { exec } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.6.0 2026-07-14  视频反推支持 --video-file 本地文件批量上传(走平台 signed-upload
+//                    直传 R2, 与网页同通道), 与 --video-url 可混用
 // v1.5.0 2026-07-14  新增 submit --mode video --video-url 视频反推(直调平台端点),带
 //                    --market 反推完自动洗稿; 本地文件上传走网页
 // v1.4.1 2026-07-14  continue 支持 --episodes N(续跑指定集数,如再跑5集)
@@ -22,7 +24,7 @@ import { exec } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.5.0';
+const VERSION = '1.6.0';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -278,18 +280,23 @@ async function cmdSubmit() {
   console.log(`下一步: chenyu-pro status --project ${pid.slice(-8)} [--watch]`);
 }
 
+const VIDEO_MIME = { '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.mkv': 'video/x-matroska', '.webm': 'video/webm', '.avi': 'video/x-msvideo', '.m4v': 'video/x-m4v', '.flv': 'video/x-flv', '.ts': 'video/mp2t' };
+const guessVideoMime = (name) => VIDEO_MIME[path.extname(name).toLowerCase()] || 'video/mp4';
+
 // 视频反推（洗稿源=视频）：直接调平台现成端点——建 video_reverse 项目 + /video-reverse/start。
+// 支持批量：--video-url 多链接逗号分隔，--video-file 多本地文件逗号分隔（走 signed-upload），两者可混用。
 // 给了 --market 就自动接洗稿（平台 auto_rewrite：反推完自动建洗稿项目并开跑，时长跟源视频每集）。
-// 本地视频文件上传要走 signed-upload multipart，CLI 暂只做链接；本地文件请走网页。
 async function cmdSubmitVideo() {
   const urls = arg('video-url', '').split(',').map((s) => s.trim()).filter((s) => /^https?:\/\//i.test(s));
-  if (!urls.length) die('缺 --video-url <视频链接>（多个用英文逗号分隔）。本地视频文件上传请走网页 /app/new「视频反推」。');
+  const files = arg('video-file', '').split(',').map((s) => s.trim()).filter(Boolean).map((s) => path.resolve(s));
+  if (!urls.length && !files.length) die('缺 --video-url <链接> 或 --video-file <本地文件>（多个用英文逗号分隔，可混用）');
+  for (const f of files) { if (!fs.existsSync(f)) die('视频文件不存在: ' + f); }
   const market = arg('market', ''); // 给了才自动洗稿；不给只反推成剧本稿
   if (market && !MARKETS[market]) die('未知市场: ' + market + '，可选: ' + Object.keys(MARKETS).join('/'));
   const extra = arg('extra', '');
   const duration = Number(arg('duration', '90'));
   const channel = arg('channel', 'keep'); // to_male | to_female | keep
-  const count = urls.length;
+  const count = urls.length + files.length;
   const title = arg('title') || (market ? `视频反推·${MARKETS[market]}洗稿` : '视频反推项目');
   const body = {
     title, working_title: title,
@@ -310,8 +317,24 @@ async function cmdSubmitVideo() {
   };
   const created = await api('/api/projects', { method: 'POST', body });
   const pid = created.project.id;
-  console.log(`✓ 反推项目已创建: ${pid}（${count} 个视频链接）`);
+  console.log(`✓ 反推项目已创建: ${pid}（共 ${count} 个视频：${urls.length} 链接 + ${files.length} 本地文件）`);
   const videos = urls.map((u, i) => ({ video_url: u, episode_id: String(i + 1).padStart(3, '0') }));
+  // 本地文件批量上传：signed-upload 取直传地址 → PUT 上传字节 → 记 client_media_path
+  for (let i = 0; i < files.length; i++) {
+    const fp = files[i];
+    const name = path.basename(fp);
+    const size = fs.statSync(fp).size;
+    const mime = guessVideoMime(name);
+    process.stdout.write(`  上传 ${i + 1}/${files.length}：${name}（${(size / 1048576).toFixed(1)}MB）… `);
+    const signed = await api(`/api/projects/${pid}/client-media/signed-upload`, { method: 'POST', body: { kind: 'video', filename: name, mimeType: mime, size } });
+    const uploadUrl = signed.upload?.uploadUrl || signed.uploadUrl;
+    const mediaPath = signed.upload?.path || signed.path;
+    if (!uploadUrl || !mediaPath) die('获取视频上传地址失败');
+    const put = await fetch(uploadUrl, { method: 'PUT', body: fs.readFileSync(fp), headers: { 'Content-Type': mime } });
+    if (!put.ok) die(`视频上传失败（HTTP ${put.status}）：${name}`);
+    console.log('✓');
+    videos.push({ client_media_path: mediaPath, episode_id: String(urls.length + i + 1).padStart(3, '0'), title: name, mime_type: mime, size_bytes: size });
+  }
   await api(`/api/projects/${pid}/video-reverse/start`, { method: 'POST', body: { videos, auto_start_workflow: true, ...(extra ? { prompt: extra } : {}) } });
   if (market) console.log(`✓ 已开始反推，完成后自动洗成《${MARKETS[market]}》剧本（时长跟随源视频，${count >= 1 ? count + ' 集' : ''}）`);
   else console.log('✓ 已开始反推成剧本稿（未选 --market，不自动洗稿；反推稿可在网页「剧本洗稿·选历史项目」里用）');
@@ -448,9 +471,9 @@ function cmdHelp() {
   chenyu-pro submit --mode rewrite --title <剧名> --episodes 30 \\
       --source 源剧本.txt --market japan_ja \\
       [--director-cut] [--extra "补充要求"] [--batch 3] [--duration 90]
-  chenyu-pro submit --mode video --video-url <视频链接> [--market us_en] \\
+  chenyu-pro submit --mode video (--video-url <链接> | --video-file <本地.mp4>) [--market us_en] \\
       视频反推洗稿：反推成剧本稿；带 --market 反推完自动洗稿(时长跟源视频)
-      多个链接用英文逗号分隔；本地视频文件上传请走网页 /app/new「视频反推」
+      --video-url 链接 / --video-file 本地文件(自动上传R2)；多个逗号分隔，可混用
   chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
   chenyu-pro continue --project <id片段|剧名> [--episodes N|--full] [--watch]  续跑(不重扣):
                         默认下一批, --episodes 5 再跑5集, --full 剩余全部
