@@ -8,6 +8,8 @@ import os from 'node:os';
 import { exec } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.7.0 2026-07-14  视频反推本地批量上传断点续传(传一个存一个,中断重跑同命令
+//                    跳过已传只补未传), 解决大批量(几十集)上传被窗口杀后重传整季
 // v1.6.0 2026-07-14  视频反推支持 --video-file 本地文件批量上传(走平台 signed-upload
 //                    直传 R2, 与网页同通道), 与 --video-url 可混用
 // v1.5.0 2026-07-14  新增 submit --mode video --video-url 视频反推(直调平台端点),带
@@ -24,7 +26,7 @@ import { exec } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.6.0';
+const VERSION = '1.7.0';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -55,6 +57,12 @@ function saveConfig(cfg) {
 }
 const mask = (v) => (v && v.length > 10 ? v.slice(0, 6) + '****' + v.slice(-4) : v ? '****' : '(未设置)');
 const die = (msg) => { console.error('✗ ' + msg); process.exit(1); };
+
+// 视频批量上传断点续传清单：传一个记一个，中断后同命令重跑跳过已传的。
+const VIDEO_MANIFEST = path.join(CONFIG_DIR, 'video-uploads.json');
+function loadVideoManifest() { try { return JSON.parse(fs.readFileSync(VIDEO_MANIFEST, 'utf8')); } catch { return {}; } }
+function saveVideoManifest(m) { fs.mkdirSync(CONFIG_DIR, { recursive: true }); fs.writeFileSync(VIDEO_MANIFEST, JSON.stringify(m, null, 2), 'utf8'); }
+function hashKey(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; return h.toString(36); }
 
 // KEY 免密登录：积分 KEY → H1 一次性 SSO 票据 → 平台 session。绑了 KEY 的
 // 用户不需要单独 chenyu-pro login；session 过期也走这里自动续登。
@@ -298,32 +306,53 @@ async function cmdSubmitVideo() {
   const channel = arg('channel', 'keep'); // to_male | to_female | keep
   const count = urls.length + files.length;
   const title = arg('title') || (market ? `视频反推·${MARKETS[market]}洗稿` : '视频反推项目');
-  const body = {
-    title, working_title: title,
-    mode: 'video_reverse',
-    total_episodes: count, batch_episodes: Math.min(3, count),
-    quality_tier: arg('quality', 'strong_review'),
-    episode_duration_seconds: duration,
-    config: {
-      genre: '待反推确认', audience: arg('audience', '待确认'), production_format: '真人剧',
-      source_type: 'video_reverse_series', model_strategy: 'balanced', research_window_days: 30,
+  const resumeProject = arg('resume-project', '');
+  // 断点续传：清单按 文件集+市场+标题 定位同一任务；上传一个存一个，中断后同命令重跑
+  // 自动跳过已传的、只补未传的，全齐了才 start。彻底避免大批量上传被窗口杀后重传整季。
+  const jobKey = hashKey(files.slice().sort().join('|') + '#' + urls.slice().sort().join('|') + '#' + market + '#' + title);
+  const manifest = loadVideoManifest();
+  let entry = manifest[jobKey];
+  let pid;
+  if (resumeProject) {
+    pid = resumeProject.startsWith('project_') ? resumeProject : ('project_' + resumeProject);
+    entry = (entry && entry.projectId === pid) ? entry : { projectId: pid, uploaded: {}, started: false };
+    manifest[jobKey] = entry; saveVideoManifest(manifest);
+    console.log(`↻ 续传到指定项目 ${pid}`);
+  } else if (entry && entry.projectId && !entry.started) {
+    pid = entry.projectId;
+    console.log(`↻ 续传已有反推项目 ${pid}（已上传 ${Object.keys(entry.uploaded || {}).length}/${files.length}，跳过已传只补未传）`);
+  } else {
+    const body = {
+      title, working_title: title,
+      mode: 'video_reverse',
+      total_episodes: count, batch_episodes: Math.min(3, count),
+      quality_tier: arg('quality', 'strong_review'),
       episode_duration_seconds: duration,
-      config_json: {
-        created_from: 'chenyu-pro-cli-video',
-        // 选了市场即启用自动洗稿：服务端 onCompleted 反推完自动建洗稿项目并开跑
-        ...(market ? { auto_rewrite: { market, channel, names: true, places: true, dialogue: true, extra, ...(flag('director-cut') ? { director_cut: true } : {}) } } : {})
+      config: {
+        genre: '待反推确认', audience: arg('audience', '待确认'), production_format: '真人剧',
+        source_type: 'video_reverse_series', model_strategy: 'balanced', research_window_days: 30,
+        episode_duration_seconds: duration,
+        config_json: {
+          created_from: 'chenyu-pro-cli-video',
+          // 选了市场即启用自动洗稿：服务端 onCompleted 反推完自动建洗稿项目并开跑
+          ...(market ? { auto_rewrite: { market, channel, names: true, places: true, dialogue: true, extra, ...(flag('director-cut') ? { director_cut: true } : {}) } } : {})
+        }
       }
-    }
-  };
-  const created = await api('/api/projects', { method: 'POST', body });
-  const pid = created.project.id;
-  console.log(`✓ 反推项目已创建: ${pid}（共 ${count} 个视频：${urls.length} 链接 + ${files.length} 本地文件）`);
-  const videos = urls.map((u, i) => ({ video_url: u, episode_id: String(i + 1).padStart(3, '0') }));
-  // 本地文件批量上传：signed-upload 取直传地址 → PUT 上传字节 → 记 client_media_path
+    };
+    const created = await api('/api/projects', { method: 'POST', body });
+    pid = created.project.id;
+    entry = { projectId: pid, uploaded: {}, started: false };
+    manifest[jobKey] = entry; saveVideoManifest(manifest);
+    console.log(`✓ 反推项目已创建: ${pid}（共 ${count} 个：${urls.length} 链接 + ${files.length} 本地文件）`);
+  }
+  entry.uploaded = entry.uploaded || {};
+  // 本地文件批量上传（跳过已传，传一个立即落盘清单 → 可断点续传）
+  let done = 0;
   for (let i = 0; i < files.length; i++) {
     const fp = files[i];
     const name = path.basename(fp);
     const size = fs.statSync(fp).size;
+    if (entry.uploaded[fp] && entry.uploaded[fp].client_media_path) { done++; continue; }
     const mime = guessVideoMime(name);
     process.stdout.write(`  上传 ${i + 1}/${files.length}：${name}（${(size / 1048576).toFixed(1)}MB）… `);
     const signed = await api(`/api/projects/${pid}/client-media/signed-upload`, { method: 'POST', body: { kind: 'video', filename: name, mimeType: mime, size } });
@@ -332,11 +361,21 @@ async function cmdSubmitVideo() {
     if (!uploadUrl || !mediaPath) die('获取视频上传地址失败');
     const put = await fetch(uploadUrl, { method: 'PUT', body: fs.readFileSync(fp), headers: { 'Content-Type': mime } });
     if (!put.ok) die(`视频上传失败（HTTP ${put.status}）：${name}`);
-    console.log('✓');
-    videos.push({ client_media_path: mediaPath, episode_id: String(urls.length + i + 1).padStart(3, '0'), title: name, mime_type: mime, size_bytes: size });
+    entry.uploaded[fp] = { client_media_path: mediaPath, title: name, mime_type: mime, size_bytes: size };
+    saveVideoManifest(manifest);
+    done++;
+    console.log(`✓ (${done}/${files.length})`);
   }
+  // 组 videos：URL 在前，本地文件按原顺序在后
+  const videos = urls.map((u, i) => ({ video_url: u, episode_id: String(i + 1).padStart(3, '0') }));
+  files.forEach((fp, i) => {
+    const u = entry.uploaded[fp];
+    videos.push({ client_media_path: u.client_media_path, episode_id: String(urls.length + i + 1).padStart(3, '0'), title: u.title, mime_type: u.mime_type, size_bytes: u.size_bytes });
+  });
+  console.log(`✓ 全部 ${videos.length} 个视频就绪，开始反推…`);
   await api(`/api/projects/${pid}/video-reverse/start`, { method: 'POST', body: { videos, auto_start_workflow: true, ...(extra ? { prompt: extra } : {}) } });
-  if (market) console.log(`✓ 已开始反推，完成后自动洗成《${MARKETS[market]}》剧本（时长跟随源视频，${count >= 1 ? count + ' 集' : ''}）`);
+  entry.started = true; saveVideoManifest(manifest);
+  if (market) console.log(`✓ 已开始反推，完成后自动洗成《${MARKETS[market]}》剧本（时长跟随源视频，${count} 集）`);
   else console.log('✓ 已开始反推成剧本稿（未选 --market，不自动洗稿；反推稿可在网页「剧本洗稿·选历史项目」里用）');
   console.log(`下一步: chenyu-pro status --project ${pid.slice(-8)} --watch  盯反推${market ? '+洗稿' : ''}进度`);
 }
@@ -474,6 +513,7 @@ function cmdHelp() {
   chenyu-pro submit --mode video (--video-url <链接> | --video-file <本地.mp4>) [--market us_en] \\
       视频反推洗稿：反推成剧本稿；带 --market 反推完自动洗稿(时长跟源视频)
       --video-url 链接 / --video-file 本地文件(自动上传R2)；多个逗号分隔，可混用
+      大批量本地文件支持断点续传：中断后重跑同一条命令，自动跳过已传、只补未传
   chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
   chenyu-pro continue --project <id片段|剧名> [--episodes N|--full] [--watch]  续跑(不重扣):
                         默认下一批, --episodes 5 再跑5集, --full 剩余全部
