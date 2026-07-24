@@ -42,7 +42,10 @@ CLI 位置：本 Skill 目录 `scripts/chenyu_pro_cli.mjs`，安装器已创建 
    - `chenyu-pro key set <KEY>`：只绑 KEY 快速免密，但走独立身份（项目不进网页账号）。
    绝不把 KEY/密码写进回复或日志。
 2. **收集需求**（缺什么问什么，别全问）：
-   - 模式：洗稿（有源剧本）/ 网文改编（有小说）/ 原创
+   - 模式：洗稿（有源剧本）/ 网文改编（有小说）/ 原创 / 视频反推（有视频）
+     - **视频反推**：`chenyu-pro submit --mode video --video-url <链接> [--market us_en]`
+       ——反推成剧本稿；带 `--market` 反推完自动洗稿（时长跟源视频）。多个链接英文逗号
+       分隔。**本地视频文件上传 CLI 暂不支持，引导用户走网页 /app/new「视频反推」。**
    - 洗稿必选目标市场：us_en/latam_es/brazil_pt/japan_ja/korea_ko/thailand_th/vietnam_vi/indonesia_id/cn_reskin
      - **`cn_reskin`（中文换背景）不出海、仍是中文剧，场景就该是中式的**——想要欧美/日韩
        洋场景就选对应出海市场。选 cn_reskin 时**问用户换成什么新背景**（年代/地域/行业，

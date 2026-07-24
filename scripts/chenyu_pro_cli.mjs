@@ -8,6 +8,8 @@ import os from 'node:os';
 import { exec } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.5.0 2026-07-14  新增 submit --mode video --video-url 视频反推(直调平台端点),带
+//                    --market 反推完自动洗稿; 本地文件上传走网页
 // v1.4.1 2026-07-14  continue 支持 --episodes N(续跑指定集数,如再跑5集)
 // v1.4.0 2026-07-14  新增 continue 命令(首批暂停后续跑全量不重扣) + SKILL 硬规则
 //                    绝不自己写剧本(换对话也先 projects 找项目 continue，不代写)
@@ -20,7 +22,7 @@ import { exec } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.4.1';
+const VERSION = '1.5.0';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -227,7 +229,8 @@ function buildRewriteDirective(marketKey, extra) {
 }
 
 async function cmdSubmit() {
-  const mode = arg('mode', 'rewrite'); // rewrite | adaptation | original 暂主打 rewrite/adaptation
+  const mode = arg('mode', 'rewrite'); // rewrite | adaptation | original | video
+  if (mode === 'video') return cmdSubmitVideo();
   const title = arg('title') || die('缺 --title 剧名');
   const episodes = Number(arg('episodes', '30'));
   const sourceFile = arg('source');
@@ -273,6 +276,46 @@ async function cmdSubmit() {
   const started = await api(`/api/projects/${pid}/workflow/start-auto`, { method: 'POST', body: {} });
   console.log('✓ 已开跑: job=' + (started.job?.id || '?'));
   console.log(`下一步: chenyu-pro status --project ${pid.slice(-8)} [--watch]`);
+}
+
+// 视频反推（洗稿源=视频）：直接调平台现成端点——建 video_reverse 项目 + /video-reverse/start。
+// 给了 --market 就自动接洗稿（平台 auto_rewrite：反推完自动建洗稿项目并开跑，时长跟源视频每集）。
+// 本地视频文件上传要走 signed-upload multipart，CLI 暂只做链接；本地文件请走网页。
+async function cmdSubmitVideo() {
+  const urls = arg('video-url', '').split(',').map((s) => s.trim()).filter((s) => /^https?:\/\//i.test(s));
+  if (!urls.length) die('缺 --video-url <视频链接>（多个用英文逗号分隔）。本地视频文件上传请走网页 /app/new「视频反推」。');
+  const market = arg('market', ''); // 给了才自动洗稿；不给只反推成剧本稿
+  if (market && !MARKETS[market]) die('未知市场: ' + market + '，可选: ' + Object.keys(MARKETS).join('/'));
+  const extra = arg('extra', '');
+  const duration = Number(arg('duration', '90'));
+  const channel = arg('channel', 'keep'); // to_male | to_female | keep
+  const count = urls.length;
+  const title = arg('title') || (market ? `视频反推·${MARKETS[market]}洗稿` : '视频反推项目');
+  const body = {
+    title, working_title: title,
+    mode: 'video_reverse',
+    total_episodes: count, batch_episodes: Math.min(3, count),
+    quality_tier: arg('quality', 'strong_review'),
+    episode_duration_seconds: duration,
+    config: {
+      genre: '待反推确认', audience: arg('audience', '待确认'), production_format: '真人剧',
+      source_type: 'video_reverse_series', model_strategy: 'balanced', research_window_days: 30,
+      episode_duration_seconds: duration,
+      config_json: {
+        created_from: 'chenyu-pro-cli-video',
+        // 选了市场即启用自动洗稿：服务端 onCompleted 反推完自动建洗稿项目并开跑
+        ...(market ? { auto_rewrite: { market, channel, names: true, places: true, dialogue: true, extra, ...(flag('director-cut') ? { director_cut: true } : {}) } } : {})
+      }
+    }
+  };
+  const created = await api('/api/projects', { method: 'POST', body });
+  const pid = created.project.id;
+  console.log(`✓ 反推项目已创建: ${pid}（${count} 个视频链接）`);
+  const videos = urls.map((u, i) => ({ video_url: u, episode_id: String(i + 1).padStart(3, '0') }));
+  await api(`/api/projects/${pid}/video-reverse/start`, { method: 'POST', body: { videos, auto_start_workflow: true, ...(extra ? { prompt: extra } : {}) } });
+  if (market) console.log(`✓ 已开始反推，完成后自动洗成《${MARKETS[market]}》剧本（时长跟随源视频，${count >= 1 ? count + ' 集' : ''}）`);
+  else console.log('✓ 已开始反推成剧本稿（未选 --market，不自动洗稿；反推稿可在网页「剧本洗稿·选历史项目」里用）');
+  console.log(`下一步: chenyu-pro status --project ${pid.slice(-8)} --watch  盯反推${market ? '+洗稿' : ''}进度`);
 }
 
 async function findProject(fragment) {
@@ -405,6 +448,9 @@ function cmdHelp() {
   chenyu-pro submit --mode rewrite --title <剧名> --episodes 30 \\
       --source 源剧本.txt --market japan_ja \\
       [--director-cut] [--extra "补充要求"] [--batch 3] [--duration 90]
+  chenyu-pro submit --mode video --video-url <视频链接> [--market us_en] \\
+      视频反推洗稿：反推成剧本稿；带 --market 反推完自动洗稿(时长跟源视频)
+      多个链接用英文逗号分隔；本地视频文件上传请走网页 /app/new「视频反推」
   chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
   chenyu-pro continue --project <id片段|剧名> [--episodes N|--full] [--watch]  续跑(不重扣):
                         默认下一批, --episodes 5 再跑5集, --full 剩余全部
