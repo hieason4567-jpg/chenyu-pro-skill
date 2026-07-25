@@ -8,6 +8,8 @@ import os from 'node:os';
 import { exec, spawn, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.8.8 2026-07-25  fetch 改用服务端归一化分集(/script-episodes)：标题回填、对白「说话人：
+//                    “台词”」、紧凑排版、去空特效行，与平台云同步/导出同格式；不再本地读原始产物
 // v1.8.7 2026-07-25  A路(原创/改编)也支持 --market：蓝图与正文按目标市场名字/货币/称谓
 //                    原生落地(不给=中文)；引擎侧 market 已成一等公民，四道命名/货币门随之启用
 // v1.8.6 2026-07-25  submit --mode rewrite 走B路(忠实换壳)+ --from-project 复用反推稿洗
@@ -42,7 +44,7 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.8.7';
+const VERSION = '1.8.8';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -551,47 +553,21 @@ async function cmdFetch() {
   const fragment = arg('project') || die('缺 --project');
   const outDir = path.resolve(arg('out', './chenyu-pro-output'));
   const p = await findProject(fragment);
-  const arts = (await api(`/api/projects/${p.id}/artifacts`)).artifacts || [];
-  const texts = arts.filter((a) => /第\d+集正文/.test(String(a.title || '')));
-  // 每集选一份：交付版(03_正文_) > 可读版 > 其他；A15 原始步骤记录（带
-  // step_id/model 元数据头）绝不能发给用户。
-  const epOf = (a) => {
-    const m = String(a.title || '').match(/第(\d+)集正文/);
-    return m ? m[1] : String(a.episode || '');
-  };
-  const score = (a) => {
-    const t = String(a.title || '');
-    let s = 0;
-    if (/^03_正文_/.test(t)) s += 100;
-    if (/readable|可读/i.test(t)) s += 10;
-    if (/返修/.test(t)) s -= 3;
-    if (/^A\d/.test(t)) s -= 5;
-    return s;
-  };
-  const byEp = new Map();
-  for (const a of texts) {
-    const ep = epOf(a);
-    const prev = byEp.get(ep);
-    if (!prev || score(a) > score(prev) || (score(a) === score(prev) && String(a.created_at || '') > String(prev.created_at || ''))) byEp.set(ep, a);
-  }
-  const eps = [...byEp.entries()].sort((x, y) => x[0].localeCompare(y[0])).map(([, a]) => a);
+  // 用服务端归一化后的分集正文（标题回填 / 对白「说话人：“台词”」/ 紧凑排版 / 去空特效行），
+  // 与平台云同步/导出同一格式；不再本地读原始产物、也不再本地剥元数据头。
+  const eps = ((await api(`/api/projects/${p.id}/script-episodes`)).episodes || [])
+    .filter((e) => String(e.content || '').trim());
   if (!eps.length) die('该项目还没有正文产物（未完成或未生成）');
-  // 剥掉步骤元数据头（"# A15 …"、"- step_id: …"等），正文从集标题/场景头开始。
-  const stripMeta = (text) => {
-    const lines = String(text || '').split(/\r?\n/);
-    const start = lines.findIndex((l) => /^第\d+集/.test(l.trim()) || /^\d+-\d+\s/.test(l.trim()));
-    return start > 0 ? lines.slice(start).join('\n') : text;
-  };
   fs.mkdirSync(outDir, { recursive: true });
   const merged = [];
-  for (const a of eps) {
-    const content = stripMeta(String((await api(`/api/artifacts/${a.id}/content`)).content || '')).trim();
-    const fileName = `第${epOf(a)}集正文.txt`;
-    fs.writeFileSync(path.join(outDir, fileName), content, 'utf8');
+  for (const e of eps) {
+    const content = String(e.content || '').trim();
+    const pad = String(e.episode || '').padStart(3, '0');
+    fs.writeFileSync(path.join(outDir, `第${pad}集正文.txt`), content, 'utf8');
     merged.push(content);
   }
-  fs.writeFileSync(path.join(outDir, '全剧合并.txt'), merged.join('\n\n'), 'utf8');
-  console.log(`✓ 已导出 ${eps.length} 集到 ${outDir}（含 全剧合并.txt）`);
+  fs.writeFileSync(path.join(outDir, '全剧合并.txt'), merged.join('\n\n\n————————\n\n\n'), 'utf8');
+  console.log(`✓ 已导出 ${eps.length} 集到 ${outDir}（含 全剧合并.txt，已按平台统一格式归一化）`);
 }
 
 async function cmdSync() {
