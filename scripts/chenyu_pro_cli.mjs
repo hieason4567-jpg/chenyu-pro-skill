@@ -8,6 +8,8 @@ import os from 'node:os';
 import { exec, spawn, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.8.9 2026-07-25  submit 加 --shots：默认纯剧本(场景+动作+对白)，--shots 才加拍摄分镜层
+//                    (画面/运镜/特效/转场)。引擎 shot_directions 默认关，director-cut 隐含开启。
 // v1.8.8 2026-07-25  fetch 改用服务端归一化分集(/script-episodes)：标题回填、对白「说话人：
 //                    “台词”」、紧凑排版、去空特效行，与平台云同步/导出同格式；不再本地读原始产物
 // v1.8.7 2026-07-25  A路(原创/改编)也支持 --market：蓝图与正文按目标市场名字/货币/称谓
@@ -44,7 +46,7 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.8.8';
+const VERSION = '1.8.9';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -347,7 +349,9 @@ async function cmdSubmit() {
         // 原创/改编（A 路）显式 --market 时，蓝图与正文按目标市场落地（名字/货币/称谓）
         ...((mode === 'original' || mode === 'adaptation') && marketExplicit ? { market } : {}),
         ...(model && model !== 'auto' ? { writer_model: model } : {}),
-        ...(flag('director-cut') ? { director_cut: true } : {})
+        ...(flag('director-cut') ? { director_cut: true } : {}),
+        // --shots 才加拍摄分镜层（画面/运镜/特效/转场）；默认纯剧本
+        ...(flag('shots') ? { shot_directions: true } : {})
       }
     }
   };
@@ -410,7 +414,7 @@ async function cmdSubmitVideo() {
         config_json: {
           created_from: 'chenyu-pro-cli-video',
           // 选了市场即启用自动洗稿：服务端 onCompleted 反推完自动建洗稿项目并开跑
-          ...(market ? { auto_rewrite: { market, channel, names: true, places: true, dialogue: true, extra, ...(flag('director-cut') ? { director_cut: true } : {}) } } : {})
+          ...(market ? { auto_rewrite: { market, channel, names: true, places: true, dialogue: true, extra, ...(flag('director-cut') ? { director_cut: true } : {}), ...(flag('shots') ? { shot_directions: true } : {}) } } : {})
         }
       }
     };
@@ -604,6 +608,7 @@ function cmdHelp() {
       (--source 源剧本.txt | --from-project <反推母项目id片段>) \\
       [--director-cut] [--extra "补充要求"] [--batch 3]
       --from-project: 复用某个视频反推稿去洗"另一个市场版"(不重反推，省钱)
+      [--shots]: 加拍摄分镜层(画面/运镜/特效/转场)；默认纯剧本(场景+动作+对白，干净好读)
   chenyu-pro submit --mode video (--video-url <链接> | --video-file <本地.mp4>) [--market us_en] \\
       视频反推洗稿(B路)：先反推成剧本稿(另存母项目可复用)；带 --market 反推完自动洗稿(时长跟源视频)
       --video-url 链接 / --video-file 本地文件(自动上传R2)；多个逗号分隔，可混用
