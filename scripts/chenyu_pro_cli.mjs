@@ -38,7 +38,7 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.8.4';
+const VERSION = '1.8.5';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -319,7 +319,8 @@ async function cmdSubmit() {
       adaptation_directive: directive,
       config_json: {
         created_from: 'chenyu-pro-cli',
-        ...(mode === 'rewrite' ? { market } : {}),
+        // 剧本洗稿 = B 路（忠实换壳：集数1:1、不卡每集时长、逐集质量门）；网文改编/原创走 A 路（蓝图）
+        ...(mode === 'rewrite' ? { market, wash_lane: 'reverse_faithful' } : {}),
         ...(model && model !== 'auto' ? { writer_model: model } : {}),
         ...(flag('director-cut') ? { director_cut: true } : {})
       }
