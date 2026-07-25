@@ -8,6 +8,8 @@ import os from 'node:os';
 import { exec, spawn, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.8.6 2026-07-25  submit --mode rewrite 走B路(忠实换壳)+ --from-project 复用反推稿洗
+//                    另一市场版(不重反推); help 补 A路(原创/改编,蓝图)与两路标注
 // v1.8.4 2026-07-24  视频上传改有界并发(默认4路,压缩吃CPU+上传吃网络重叠,比串行快2-3倍);
 //                    --concurrency N 调, =1 退回串行。断点续传/清单落盘不变。
 // v1.8.3 2026-07-24  修压缩静默失败: resolveFfmpeg 探测 -encoders,优先选带 libx264 的
@@ -38,7 +40,7 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.8.5';
+const VERSION = '1.8.6';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -293,15 +295,30 @@ async function cmdSubmit() {
   const title = arg('title') || die('缺 --title 剧名');
   const episodes = Number(arg('episodes', '30'));
   const sourceFile = arg('source');
+  const fromProject = arg('from-project', ''); // 从已有项目(如视频反推母项目)拉反推稿当洗稿源，复用不重反推
   const market = arg('market', 'us_en');
   const model = arg('model', '');
   const extra = arg('extra', '');
   const batch = Number(arg('batch', '3'));
   const duration = Number(arg('duration', '90'));
-  if (mode !== 'original' && !sourceFile) die('rewrite/adaptation 模式需要 --source <源文件.txt/.md>');
   if (mode === 'rewrite' && !MARKETS[market]) die('未知市场: ' + market + '，可选: ' + Object.keys(MARKETS).join('/'));
-  const sourceText = sourceFile ? fs.readFileSync(path.resolve(sourceFile), 'utf8') : '';
-  if (sourceFile && sourceText.trim().length < 100) die('源文本太短');
+  let sourceText = '';
+  let sourceLabel = sourceFile ? path.basename(sourceFile) : '源材料.md';
+  if (fromProject) {
+    const sp = await findProject(fromProject);
+    const arts = (await api(`/api/projects/${sp.id}/artifacts`)).artifacts || [];
+    const srcArt = arts
+      .filter((a) => a.type === 'source_file' || /反推稿|视频反推/.test(String(a.title || '')))
+      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))[0];
+    if (!srcArt) die(`来源项目《${sp.title}》没有反推稿/源稿，不能作洗稿源`);
+    sourceText = String((await api(`/api/artifacts/${srcArt.id}/content`)).content || '');
+    sourceLabel = `${sp.title}·反推稿.md`;
+    console.log(`✓ 已载入来源项目《${sp.title}》的反推稿 (${sourceText.length} 字) —— 复用不重反推`);
+  } else if (mode !== 'original') {
+    if (!sourceFile) die('rewrite/adaptation 需要 --source <源文件.txt/.md> 或 --from-project <反推母项目id片段>');
+    sourceText = fs.readFileSync(path.resolve(sourceFile), 'utf8');
+  }
+  if ((sourceFile || fromProject) && sourceText.trim().length < 100) die('源文本太短');
 
   const directive = mode === 'rewrite' ? buildRewriteDirective(market, extra) : (extra || '按原剧情忠实改编');
   const body = {
@@ -330,7 +347,7 @@ async function cmdSubmit() {
   const pid = created.project.id;
   console.log('✓ 项目已创建: ' + pid);
   if (sourceText) {
-    await api(`/api/projects/${pid}/files`, { method: 'POST', body: { filename: path.basename(sourceFile), title: '源材料', type: 'source_file', step_id: 'A01A', content: sourceText } });
+    await api(`/api/projects/${pid}/files`, { method: 'POST', body: { filename: sourceLabel, title: '源材料', type: 'source_file', step_id: 'A01A', content: sourceText } });
     console.log('✓ 源文件已上传 (' + sourceText.length + ' 字)');
   }
   const started = await api(`/api/projects/${pid}/workflow/start-auto`, { method: 'POST', body: {} });
@@ -600,14 +617,19 @@ function cmdHelp() {
   chenyu-pro key set <积分KEY> | key show                  仅绑积分 KEY（快速免密，但走独立身份）
   chenyu-pro credits                                       查用户名·余额
   chenyu-pro estimate --episodes 30 [--director-cut]       预估消耗+余额校验
-  chenyu-pro submit --mode rewrite --title <剧名> --episodes 30 \\
-      --source 源剧本.txt --market japan_ja \\
-      [--director-cut] [--extra "补充要求"] [--batch 3] [--duration 90]
+  【B路·洗稿(照原剧情忠实换壳，集数1:1、不卡每集时长、逐集质量门)】
+  chenyu-pro submit --mode rewrite --title <剧名> --episodes 30 --market japan_ja \\
+      (--source 源剧本.txt | --from-project <反推母项目id片段>) \\
+      [--director-cut] [--extra "补充要求"] [--batch 3]
+      --from-project: 复用某个视频反推稿去洗"另一个市场版"(不重反推，省钱)
   chenyu-pro submit --mode video (--video-url <链接> | --video-file <本地.mp4>) [--market us_en] \\
-      视频反推洗稿：反推成剧本稿；带 --market 反推完自动洗稿(时长跟源视频)
+      视频反推洗稿(B路)：先反推成剧本稿(另存母项目可复用)；带 --market 反推完自动洗稿(时长跟源视频)
       --video-url 链接 / --video-file 本地文件(自动上传R2)；多个逗号分隔，可混用
       本地文件有 ffmpeg 时自动压到 480p 再传(反推只用低清代理，快一个数量级；--no-compress 关)
       大批量本地文件支持断点续传：中断后重跑同一条命令，自动跳过已传、只补未传
+  【A路·蓝图(原创 / 网文改编，剧本仅作参考再创作)】
+  chenyu-pro submit --mode original --title <剧名> --episodes 30           原创剧(走蓝图)
+  chenyu-pro submit --mode adaptation --title <剧名> --source 小说.txt     网文改编(走蓝图)
   chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
   chenyu-pro continue --project <id片段|剧名> [--episodes N|--full] [--watch]  续跑(不重扣):
                         默认下一批, --episodes 5 再跑5集, --full 剩余全部
