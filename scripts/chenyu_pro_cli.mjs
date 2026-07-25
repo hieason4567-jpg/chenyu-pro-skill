@@ -8,6 +8,8 @@ import os from 'node:os';
 import { exec, spawn, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v1.8.7 2026-07-25  A路(原创/改编)也支持 --market：蓝图与正文按目标市场名字/货币/称谓
+//                    原生落地(不给=中文)；引擎侧 market 已成一等公民，四道命名/货币门随之启用
 // v1.8.6 2026-07-25  submit --mode rewrite 走B路(忠实换壳)+ --from-project 复用反推稿洗
 //                    另一市场版(不重反推); help 补 A路(原创/改编,蓝图)与两路标注
 // v1.8.4 2026-07-24  视频上传改有界并发(默认4路,压缩吃CPU+上传吃网络重叠,比串行快2-3倍);
@@ -40,7 +42,7 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.8.6';
+const VERSION = '1.8.7';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -297,11 +299,13 @@ async function cmdSubmit() {
   const sourceFile = arg('source');
   const fromProject = arg('from-project', ''); // 从已有项目(如视频反推母项目)拉反推稿当洗稿源，复用不重反推
   const market = arg('market', 'us_en');
+  const marketExplicit = args.includes('--market'); // 原创/改编：只有显式 --market 才落地国外市场，否则中文
   const model = arg('model', '');
   const extra = arg('extra', '');
   const batch = Number(arg('batch', '3'));
   const duration = Number(arg('duration', '90'));
   if (mode === 'rewrite' && !MARKETS[market]) die('未知市场: ' + market + '，可选: ' + Object.keys(MARKETS).join('/'));
+  if ((mode === 'original' || mode === 'adaptation') && marketExplicit && !MARKETS[market]) die('未知市场: ' + market + '，可选: ' + Object.keys(MARKETS).join('/'));
   let sourceText = '';
   let sourceLabel = sourceFile ? path.basename(sourceFile) : '源材料.md';
   if (fromProject) {
@@ -338,6 +342,8 @@ async function cmdSubmit() {
         created_from: 'chenyu-pro-cli',
         // 剧本洗稿 = B 路（忠实换壳：集数1:1、不卡每集时长、逐集质量门）；网文改编/原创走 A 路（蓝图）
         ...(mode === 'rewrite' ? { market, wash_lane: 'reverse_faithful' } : {}),
+        // 原创/改编（A 路）显式 --market 时，蓝图与正文按目标市场落地（名字/货币/称谓）
+        ...((mode === 'original' || mode === 'adaptation') && marketExplicit ? { market } : {}),
         ...(model && model !== 'auto' ? { writer_model: model } : {}),
         ...(flag('director-cut') ? { director_cut: true } : {})
       }
@@ -628,8 +634,10 @@ function cmdHelp() {
       本地文件有 ffmpeg 时自动压到 480p 再传(反推只用低清代理，快一个数量级；--no-compress 关)
       大批量本地文件支持断点续传：中断后重跑同一条命令，自动跳过已传、只补未传
   【A路·蓝图(原创 / 网文改编，剧本仅作参考再创作)】
-  chenyu-pro submit --mode original --title <剧名> --episodes 30           原创剧(走蓝图)
-  chenyu-pro submit --mode adaptation --title <剧名> --source 小说.txt     网文改编(走蓝图)
+  chenyu-pro submit --mode original --title <剧名> --episodes 30 [--market us_en]   原创剧(走蓝图)
+  chenyu-pro submit --mode adaptation --title <剧名> --source 小说.txt [--market japan_ja]  网文改编(走蓝图)
+      --market: 原创/改编也能面向国外市场——蓝图与正文按目标市场名字/货币/称谓原生落地(不给=中文)
+      可选市场: us_en/latam_es/brazil_pt/japan_ja/korea_ko/thailand_th/vietnam_vi/indonesia_id
   chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
   chenyu-pro continue --project <id片段|剧名> [--episodes N|--full] [--watch]  续跑(不重扣):
                         默认下一批, --episodes 5 再跑5集, --full 剩余全部
