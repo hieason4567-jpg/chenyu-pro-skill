@@ -1,13 +1,29 @@
 #!/usr/bin/env node
-// 辰屿 Pro CLI —— 剧本生产平台的命令行入口（操作员模式：提交/盯进度/交付，
-// 写作与质量硬门全在服务端，提示词不出服务器）。零依赖，Node 18+。
-// 配置存 ~/.codex/chenyu-pro/config.json（KEY/session 掩码显示，绝不写入日志）。
+// 辰屿 Pro CLI —— Agent 编剧模式命令行（v2.x）：写作由安装 Skill 的用户 Agent 完成，
+// 不消耗平台积分；本 CLI 只做 鉴权/项目壳/正文回传/只读查询/交付。
+// CLI 内不存在任何能触发平台模型生成或扣积分的调用（v2.1.0 起物理移除）。
+// 零依赖，Node 18+。配置存 ~/.codex/chenyu-pro/config.json（KEY/session 掩码显示，绝不写入日志）。
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { exec, spawn, spawnSync } from 'node:child_process';
+import { exec } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.2.1 2026-08-31  gate 加小说/散文源材料识别：叙述行占绝对多数且无剧本结构时，
+//                    不再按行号误导打补丁，直接提示先改编成剧本格式再过门。
+// v2.2.0 2026-08-31  新增 gate 格式门：确定性剧本质量校验（纯本地正则，零模型调用，
+//                    跑门前仅鉴权）。核心硬门=对白连发段(连续>=3句台词无△动作行)逐段报
+//                    行号与补写位置；另查 △心理活动词/台词超长/场次头/配比。Agent 任何
+//                    写作链路(自写/洗稿/改编)写完过门到 GATE_PASS 即达辰屿质量标准，
+//                    不必走 create/save 全流程。save 默认先过门(--skip-gate 跳过)。
+// v2.1.0 2026-08-31  彻底移除平台代写路径：submit/continue/estimate 及视频反推/上传/压缩
+//                    代码整体删除。CLI 中不再存在任何能触发平台模型生成或扣积分的调用；
+//                    仅剩 鉴权/项目壳/正文回传/只读查询/交付 六类端点。
+// v2.0.0 2026-08-31  架构反转：写作改由安装 Skill 的用户 Agent 完成（不消耗平台积分），
+//                    平台只做鉴权与项目/交付管理。新增 auth(鉴权门，Agent 动笔前必须通过)、
+//                    create(建项目壳，不触发平台生成、零积分)、save(回传 Agent 写的正文，
+//                    按 A15 正文产物契约入库 → fetch/sync/word 交付链路直接可用)。
+//                    submit(平台代写)保留为付费兼容模式，Skill 默认不再使用。
 // v1.8.9 2026-07-25  submit 加 --shots：默认纯剧本(场景+动作+对白)，--shots 才加拍摄分镜层
 //                    (画面/运镜/特效/转场)。引擎 shot_directions 默认关，director-cut 隐含开启。
 // v1.8.8 2026-07-25  fetch 改用服务端归一化分集(/script-episodes)：标题回填、对白「说话人：
@@ -46,15 +62,13 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '1.8.9';
+const VERSION = '2.2.1';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 const DEFAULT_PLATFORM = 'https://chenyu.pumpumai.com';
 const DEFAULT_CREDIT_BASE = 'https://drama.pumpumai.com';
 
-// 每集消耗经验值（分）——按主力模型，含 Flash 辅助地板 ~40 分（2026-07 实测口径）
-const COST_PER_EPISODE = { 'auto': 113, 'deepseek-v4-pro': 113, 'grok-4.5': 77, 'gpt-5.6-luna': 77, 'gemini-3.5-flash': 77, 'gpt-5.6-sol': 151 };
 const MARKETS = {
   us_en: '英语·欧美', latam_es: '西语·拉美', brazil_pt: '葡语·巴西', japan_ja: '日本',
   korea_ko: '韩国', thailand_th: '泰国', vietnam_vi: '越南', indonesia_id: '印尼', cn_reskin: '中文换背景'
@@ -77,49 +91,6 @@ function saveConfig(cfg) {
 }
 const mask = (v) => (v && v.length > 10 ? v.slice(0, 6) + '****' + v.slice(-4) : v ? '****' : '(未设置)');
 const die = (msg) => { console.error('✗ ' + msg); process.exit(1); };
-
-// 视频批量上传断点续传清单：传一个记一个，中断后同命令重跑跳过已传的。
-const VIDEO_MANIFEST = path.join(CONFIG_DIR, 'video-uploads.json');
-function loadVideoManifest() { try { return JSON.parse(fs.readFileSync(VIDEO_MANIFEST, 'utf8')); } catch { return {}; } }
-function saveVideoManifest(m) { fs.mkdirSync(CONFIG_DIR, { recursive: true }); fs.writeFileSync(VIDEO_MANIFEST, JSON.stringify(m, null, 2), 'utf8'); }
-function hashKey(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; return h.toString(36); }
-
-// 上传前压缩：服务端反推只用低清分析代理(scale=-2:480)，原片纯浪费带宽。
-// 有 ffmpeg 就先压到 480p（保留音轨供对白识别），上传小一个数量级；没有则传原片。
-// 关键：优先选带 libx264 的 ffmpeg。GPU-only 构建(只有 h264_amf/nvenc)没有 libx264，
-// 硬调 -c:v libx264 会报 "Unknown encoder 'libx264'" → 压缩失败静默传几十 MB 原片。
-// 探测每个候选的 -encoders：带 libx264 的直接用；都没有才退到可用的 GPU/软编码器。
-// 返回 {bin, vcodec, vargs} 或 null。
-function resolveFfmpeg() {
-  const cands = [process.env.CHENYU_FFMPEG, 'ffmpeg', 'C:\\ffmpeg\\bin\\ffmpeg.exe', 'C:\\ffmpeg-6.1.1\\bin\\ffmpeg.exe', 'E:\\pump2.0\\BOTV\\FFMPEG.EXE'].filter(Boolean);
-  let firstBin = null, firstEnc = '';
-  for (const c of cands) {
-    let enc;
-    try { const r = spawnSync(c, ['-hide_banner', '-encoders'], { windowsHide: true, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }); if (r.status !== 0) continue; enc = String(r.stdout || ''); } catch { continue; }
-    if (!firstBin) { firstBin = c; firstEnc = enc; }
-    if (/\blibx264\b/.test(enc)) return { bin: c, vcodec: 'libx264', vargs: ['-preset', 'veryfast', '-crf', '28'] };
-  }
-  if (!firstBin) return null;
-  const has = (n) => new RegExp('\\b' + n + '\\b').test(firstEnc);
-  if (has('h264_nvenc')) return { bin: firstBin, vcodec: 'h264_nvenc', vargs: ['-rc', 'vbr', '-cq', '30'] };
-  if (has('h264_qsv')) return { bin: firstBin, vcodec: 'h264_qsv', vargs: ['-global_quality', '30'] };
-  if (has('h264_amf')) return { bin: firstBin, vcodec: 'h264_amf', vargs: ['-rc', 'cqp', '-qp_i', '30', '-qp_p', '30', '-qp_b', '30'] };
-  if (has('mpeg4')) return { bin: firstBin, vcodec: 'mpeg4', vargs: ['-q:v', '5'] };
-  return { bin: firstBin, vcodec: 'libx264', vargs: ['-preset', 'veryfast', '-crf', '28'] };
-}
-function compressVideoProxy(ff, src, dst, height) {
-  return new Promise((resolve, reject) => {
-    try { fs.rmSync(dst, { force: true }); } catch { /* ignore */ }
-    // 视觉降到 height，保留音轨(AAC 96k)；与服务端分析代理对齐，分析零损失。
-    // 编码器由 resolveFfmpeg 探测选定(优先 libx264，GPU-only 环境退 nvenc/qsv/amf)。
-    const a = ['-y', '-i', src, '-vf', `scale=-2:${height}`, '-c:v', ff.vcodec, ...ff.vargs, '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', dst];
-    const child = spawn(ff.bin, a, { windowsHide: true });
-    let err = '';
-    child.stderr?.on('data', (d) => { err += d.toString(); if (err.length > 4000) err = err.slice(-4000); });
-    child.on('error', reject);
-    child.on('close', (s) => { (s === 0 && fs.existsSync(dst)) ? resolve() : reject(new Error(`ffmpeg 压缩失败(${s})`)); });
-  });
-}
 
 // KEY 免密登录：积分 KEY → H1 一次性 SSO 票据 → 平台 session。绑了 KEY 的
 // 用户不需要单独 chenyu-pro login；session 过期也走这里自动续登。
@@ -256,236 +227,6 @@ async function cmdCredits() {
   console.log(`${who} · 余额 ${k.pointsBalance ?? '?'} 分`);
 }
 
-async function cmdEstimate() {
-  const episodes = Number(arg('episodes', '30'));
-  const model = arg('model', 'auto');
-  const perEp = COST_PER_EPISODE[model] ?? COST_PER_EPISODE.auto;
-  const directorCut = flag('director-cut') ? 15 : 0;
-  const total = Math.round(episodes * (perEp + directorCut) * 1.2); // 1.2 重试缓冲
-  console.log(`预估: ${episodes} 集 × (${perEp}${directorCut ? '+' + directorCut + '制片级' : ''}) × 1.2缓冲 ≈ ${total} 分`);
-  try {
-    const k = (await creditApi('/api/jimeng/v1/key')).key || {};
-    const ok = Number(k.pointsBalance) >= total;
-    console.log(`余额: ${k.pointsBalance} 分 → ${ok ? '✓ 足够' : '✗ 不足，请先充值'}`);
-    if (!ok) process.exit(2);
-  } catch { console.log('（未绑定 KEY，跳过余额校验）'); }
-}
-
-function buildRewriteDirective(marketKey, extra) {
-  // 市场规则块（与网页创作台一致的公开层；核心写作/审核方法论在服务端，不在此处）
-  const M = {
-    us_en: ['美国当代都市/海滨小镇', '美元', '人物改用地道欧美英文名，家族同姓一致；禁止汉语拼音姓氏与源名谐音；场景人物行用全名，台词行与动作行只用名字 First name。', '称谓按欧美习惯。'],
-    latam_es: ['墨西哥/哥伦比亚当代都市', '美元', '人物改用西语名，家族同姓一致；禁止拼音姓氏与源名谐音；场景人物行用全名，台词行只用名字。', '称谓按拉美习惯。'],
-    brazil_pt: ['巴西里约/圣保罗当代都市', '美元', '人物改用巴西葡语名，家族同姓一致；禁止拼音姓氏与源名谐音；场景人物行用全名，台词行只用名字。', '称谓按巴西习惯。'],
-    japan_ja: ['日本当代都市/沿海町', '日元', '人物改用日式姓名（汉字书写，姓在前），家族同姓一致；禁止保留中文原名或谐音；对话用日式敬称，正文仍中文书写。', '称谓按日本习惯。'],
-    korea_ko: ['韩国首尔/釜山当代都市', '韩元', '人物改用韩式姓名（中文谐音汉字书写，姓在前），家族同姓一致；禁止保留原名；对话体现敬语层级，正文中文书写。', '称谓按韩国习惯。'],
-    thailand_th: ['泰国曼谷/海岛当代都市', '泰铢', '人物改用泰式姓名+昵称制（中文书写音译）；家族关系一致；禁止保留原名或谐音。', '称谓按泰国习惯。'],
-    vietnam_vi: ['越南胡志明市/沿海当代都市', '越南盾', '人物改用越式姓名（中文书写音译，姓在前）；家族同姓一致；禁止保留原名或谐音。', '称谓按越南习惯。'],
-    indonesia_id: ['印尼雅加达/巴厘岛当代都市', '印尼盾', '人物改用印尼名，可单名；家族关系一致；禁止拼音姓氏与源名谐音。', '称谓按印尼习惯。'],
-    cn_reskin: ['', '', '人物更换新的中文姓名，家族姓氏与关系一致，禁止沿用原名或谐音名。', '称谓按新背景调整。']
-  };
-  const [setting, currency, nameRule, kinship] = M[marketKey] || M.us_en;
-  return [
-    '洗稿换壳改编：严格保留原剧情骨架、每集节拍、场次顺序、情绪曲线与钩子位置；每段源台词与可见节拍都要有功能等价物，禁止删减。',
-    setting ? `目标市场：${MARKETS[marketKey]}。目标背景设定：${setting}。所有时代、场景、职业体系迁移为该市场的等价物。` : `目标市场：${MARKETS[marketKey]}。`,
-    nameRule,
-    `地名、机构名、称谓、头衔全部替换为该市场等价物；${currency ? `货币单位一律用${currency}，` : ''}全剧统一换算基准，系统面板数字等比换算且跨集自洽。${kinship}`,
-    '台词与叙述全部重写，语义可保留但表达不得照抄原文。正文保持中文书写（人名、地名、机构名、货币按目标市场）。',
-    extra ? `补充要求：${extra}` : ''
-  ].filter(Boolean).join('\n');
-}
-
-async function cmdSubmit() {
-  const mode = arg('mode', 'rewrite'); // rewrite | adaptation | original | video
-  if (mode === 'video') return cmdSubmitVideo();
-  const title = arg('title') || die('缺 --title 剧名');
-  const episodes = Number(arg('episodes', '30'));
-  const sourceFile = arg('source');
-  const fromProject = arg('from-project', ''); // 从已有项目(如视频反推母项目)拉反推稿当洗稿源，复用不重反推
-  const market = arg('market', 'us_en');
-  const marketExplicit = args.includes('--market'); // 原创/改编：只有显式 --market 才落地国外市场，否则中文
-  const model = arg('model', '');
-  const extra = arg('extra', '');
-  const batch = Number(arg('batch', '3'));
-  const duration = Number(arg('duration', '90'));
-  if (mode === 'rewrite' && !MARKETS[market]) die('未知市场: ' + market + '，可选: ' + Object.keys(MARKETS).join('/'));
-  if ((mode === 'original' || mode === 'adaptation') && marketExplicit && !MARKETS[market]) die('未知市场: ' + market + '，可选: ' + Object.keys(MARKETS).join('/'));
-  let sourceText = '';
-  let sourceLabel = sourceFile ? path.basename(sourceFile) : '源材料.md';
-  if (fromProject) {
-    const sp = await findProject(fromProject);
-    const arts = (await api(`/api/projects/${sp.id}/artifacts`)).artifacts || [];
-    const srcArt = arts
-      .filter((a) => a.type === 'source_file' || /反推稿|视频反推/.test(String(a.title || '')))
-      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))[0];
-    if (!srcArt) die(`来源项目《${sp.title}》没有反推稿/源稿，不能作洗稿源`);
-    sourceText = String((await api(`/api/artifacts/${srcArt.id}/content`)).content || '');
-    sourceLabel = `${sp.title}·反推稿.md`;
-    console.log(`✓ 已载入来源项目《${sp.title}》的反推稿 (${sourceText.length} 字) —— 复用不重反推`);
-  } else if (mode !== 'original') {
-    if (!sourceFile) die('rewrite/adaptation 需要 --source <源文件.txt/.md> 或 --from-project <反推母项目id片段>');
-    sourceText = fs.readFileSync(path.resolve(sourceFile), 'utf8');
-  }
-  if ((sourceFile || fromProject) && sourceText.trim().length < 100) die('源文本太短');
-
-  const directive = mode === 'rewrite' ? buildRewriteDirective(market, extra) : (extra || '按原剧情忠实改编');
-  const body = {
-    title, working_title: title,
-    mode: mode === 'original' ? 'original' : 'adaptation',
-    total_episodes: episodes, batch_episodes: batch,
-    quality_tier: arg('quality', 'strong_review'),
-    episode_duration_seconds: duration,
-    config: {
-      genre: arg('genre', mode === 'rewrite' ? MARKETS[market] + '洗稿' : '待确认'),
-      audience: arg('audience', '待确认'),
-      production_format: '真人剧', source_type: 'source_text',
-      model_strategy: 'balanced', research_window_days: 30,
-      episode_duration_seconds: duration,
-      adaptation_directive: directive,
-      config_json: {
-        created_from: 'chenyu-pro-cli',
-        // 剧本洗稿 = B 路（忠实换壳：集数1:1、不卡每集时长、逐集质量门）；网文改编/原创走 A 路（蓝图）
-        ...(mode === 'rewrite' ? { market, wash_lane: 'reverse_faithful' } : {}),
-        // 原创/改编（A 路）显式 --market 时，蓝图与正文按目标市场落地（名字/货币/称谓）
-        ...((mode === 'original' || mode === 'adaptation') && marketExplicit ? { market } : {}),
-        ...(model && model !== 'auto' ? { writer_model: model } : {}),
-        ...(flag('director-cut') ? { director_cut: true } : {}),
-        // --shots 才加拍摄分镜层（画面/运镜/特效/转场）；默认纯剧本
-        ...(flag('shots') ? { shot_directions: true } : {})
-      }
-    }
-  };
-  const created = await api('/api/projects', { method: 'POST', body });
-  const pid = created.project.id;
-  console.log('✓ 项目已创建: ' + pid);
-  if (sourceText) {
-    await api(`/api/projects/${pid}/files`, { method: 'POST', body: { filename: sourceLabel, title: '源材料', type: 'source_file', step_id: 'A01A', content: sourceText } });
-    console.log('✓ 源文件已上传 (' + sourceText.length + ' 字)');
-  }
-  const started = await api(`/api/projects/${pid}/workflow/start-auto`, { method: 'POST', body: {} });
-  console.log('✓ 已开跑: job=' + (started.job?.id || '?'));
-  console.log(`下一步: chenyu-pro status --project ${pid.slice(-8)} [--watch]`);
-}
-
-const VIDEO_MIME = { '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.mkv': 'video/x-matroska', '.webm': 'video/webm', '.avi': 'video/x-msvideo', '.m4v': 'video/x-m4v', '.flv': 'video/x-flv', '.ts': 'video/mp2t' };
-const guessVideoMime = (name) => VIDEO_MIME[path.extname(name).toLowerCase()] || 'video/mp4';
-
-// 视频反推（洗稿源=视频）：直接调平台现成端点——建 video_reverse 项目 + /video-reverse/start。
-// 支持批量：--video-url 多链接逗号分隔，--video-file 多本地文件逗号分隔（走 signed-upload），两者可混用。
-// 给了 --market 就自动接洗稿（平台 auto_rewrite：反推完自动建洗稿项目并开跑，时长跟源视频每集）。
-async function cmdSubmitVideo() {
-  const urls = arg('video-url', '').split(',').map((s) => s.trim()).filter((s) => /^https?:\/\//i.test(s));
-  const files = arg('video-file', '').split(',').map((s) => s.trim()).filter(Boolean).map((s) => path.resolve(s));
-  if (!urls.length && !files.length) die('缺 --video-url <链接> 或 --video-file <本地文件>（多个用英文逗号分隔，可混用）');
-  for (const f of files) { if (!fs.existsSync(f)) die('视频文件不存在: ' + f); }
-  const market = arg('market', ''); // 给了才自动洗稿；不给只反推成剧本稿
-  if (market && !MARKETS[market]) die('未知市场: ' + market + '，可选: ' + Object.keys(MARKETS).join('/'));
-  const extra = arg('extra', '');
-  const duration = Number(arg('duration', '90'));
-  const channel = arg('channel', 'keep'); // to_male | to_female | keep
-  const count = urls.length + files.length;
-  const title = arg('title') || (market ? `视频反推·${MARKETS[market]}洗稿` : '视频反推项目');
-  const resumeProject = arg('resume-project', '');
-  // 断点续传：清单按 文件集+市场+标题 定位同一任务；上传一个存一个，中断后同命令重跑
-  // 自动跳过已传的、只补未传的，全齐了才 start。彻底避免大批量上传被窗口杀后重传整季。
-  const jobKey = hashKey(files.slice().sort().join('|') + '#' + urls.slice().sort().join('|') + '#' + market + '#' + title);
-  const manifest = loadVideoManifest();
-  let entry = manifest[jobKey];
-  let pid;
-  if (resumeProject) {
-    pid = resumeProject.startsWith('project_') ? resumeProject : ('project_' + resumeProject);
-    entry = (entry && entry.projectId === pid) ? entry : { projectId: pid, uploaded: {}, started: false };
-    manifest[jobKey] = entry; saveVideoManifest(manifest);
-    console.log(`↻ 续传到指定项目 ${pid}`);
-  } else if (entry && entry.projectId && !entry.started) {
-    pid = entry.projectId;
-    console.log(`↻ 续传已有反推项目 ${pid}（已上传 ${Object.keys(entry.uploaded || {}).length}/${files.length}，跳过已传只补未传）`);
-  } else {
-    const body = {
-      title, working_title: title,
-      mode: 'video_reverse',
-      total_episodes: count, batch_episodes: Math.min(3, count),
-      quality_tier: arg('quality', 'strong_review'),
-      episode_duration_seconds: duration,
-      config: {
-        genre: '待反推确认', audience: arg('audience', '待确认'), production_format: '真人剧',
-        source_type: 'video_reverse_series', model_strategy: 'balanced', research_window_days: 30,
-        episode_duration_seconds: duration,
-        config_json: {
-          created_from: 'chenyu-pro-cli-video',
-          // 选了市场即启用自动洗稿：服务端 onCompleted 反推完自动建洗稿项目并开跑
-          ...(market ? { auto_rewrite: { market, channel, names: true, places: true, dialogue: true, extra, ...(flag('director-cut') ? { director_cut: true } : {}), ...(flag('shots') ? { shot_directions: true } : {}) } } : {})
-        }
-      }
-    };
-    const created = await api('/api/projects', { method: 'POST', body });
-    pid = created.project.id;
-    entry = { projectId: pid, uploaded: {}, started: false };
-    manifest[jobKey] = entry; saveVideoManifest(manifest);
-    console.log(`✓ 反推项目已创建: ${pid}（共 ${count} 个：${urls.length} 链接 + ${files.length} 本地文件）`);
-  }
-  entry.uploaded = entry.uploaded || {};
-  // 上传前压缩到分析代理分辨率（与服务端反推一致），大幅缩短上传时间；--no-compress 关闭。
-  const proxyH = Math.max(240, Number(arg('proxy-height', '480')) || 480);
-  const ffmpeg = flag('no-compress') ? null : resolveFfmpeg();
-  if (files.length && !ffmpeg && !flag('no-compress')) console.log(`  提示: 未找到 ffmpeg → 上传原始视频(慢)。装 ffmpeg 后会自动压到 ${proxyH}p 再传(小一个数量级，快很多)。`);
-  else if (files.length && ffmpeg && ffmpeg.vcodec !== 'libx264') console.log(`  提示: 当前 ffmpeg 无 libx264，改用 ${ffmpeg.vcodec} 压缩(仍压到 ${proxyH}p)。想要更稳可装带 libx264 的完整版或设 CHENYU_FFMPEG 指向它。`);
-  // 本地文件批量上传：有界并发（压缩吃 CPU、上传吃网络，重叠起来比一条条串行快 2-3 倍）。
-  // 传一个立即落盘清单 → 可断点续传；--concurrency N 调并发(默认 4)，--concurrency 1 退回串行。
-  const CONC = Math.max(1, Math.min(8, Number(arg('concurrency', '4')) || 4));
-  let done = 0, nextIdx = 0;
-  const total = files.length;
-  const already = files.filter((fp) => entry.uploaded[fp] && entry.uploaded[fp].client_media_path).length;
-  if (total) console.log(`  开始上传 ${total} 个（并发 ${CONC}${already ? `，跳过已传 ${already}` : ''}）…`);
-  async function uploadOne(i) {
-    const fp = files[i];
-    const name = path.basename(fp);
-    if (entry.uploaded[fp] && entry.uploaded[fp].client_media_path) { done++; return; }
-    const origSize = fs.statSync(fp).size;
-    let uploadPath = fp, uploadName = name, uploadMime = guessVideoMime(name), tmp = null, note = `${(origSize / 1048576).toFixed(1)}MB 原片`;
-    if (ffmpeg) {
-      tmp = path.join(os.tmpdir(), `chenyu-proxy-${process.pid}-${i}.mp4`);
-      try {
-        await compressVideoProxy(ffmpeg, fp, tmp, proxyH);
-        uploadPath = tmp; uploadName = name.replace(/\.[^.]+$/, '') + `_${proxyH}p.mp4`; uploadMime = 'video/mp4';
-        note = `${(origSize / 1048576).toFixed(1)}MB→${(fs.statSync(tmp).size / 1048576).toFixed(1)}MB`;
-      } catch { try { fs.rmSync(tmp, { force: true }); } catch { /* */ } tmp = null; uploadPath = fp; note = `${(origSize / 1048576).toFixed(1)}MB 原片(压缩失败)`; }
-    }
-    const upSize = fs.statSync(uploadPath).size;
-    const signed = await api(`/api/projects/${pid}/client-media/signed-upload`, { method: 'POST', body: { kind: 'video', filename: uploadName, mimeType: uploadMime, size: upSize } });
-    const uploadUrl = signed.upload?.uploadUrl || signed.uploadUrl;
-    const mediaPath = signed.upload?.path || signed.path;
-    if (!uploadUrl || !mediaPath) { if (tmp) try { fs.rmSync(tmp, { force: true }); } catch { /* */ } die('获取视频上传地址失败'); }
-    const put = await fetch(uploadUrl, { method: 'PUT', body: fs.readFileSync(uploadPath), headers: { 'Content-Type': uploadMime } });
-    if (tmp) try { fs.rmSync(tmp, { force: true }); } catch { /* */ }
-    if (!put.ok) die(`视频上传失败（HTTP ${put.status}）：${name}`);
-    entry.uploaded[fp] = { client_media_path: mediaPath, title: name, mime_type: uploadMime, size_bytes: upSize };
-    saveVideoManifest(manifest); // Node 单线程，writeFileSync 原子；并发 worker 共享同一 manifest 对象
-    done++;
-    console.log(`  ✓ ${done}/${total}  ${name}  ${note}`);
-  }
-  // 有界并发池：CONC 个 worker 抢 nextIdx，抢完即止
-  await Promise.all(Array.from({ length: Math.min(CONC, total || 1) }, async () => {
-    for (let i = nextIdx++; i < total; i = nextIdx++) await uploadOne(i);
-  }));
-  // 组 videos：URL 在前，本地文件按原顺序在后
-  const videos = urls.map((u, i) => ({ video_url: u, episode_id: String(i + 1).padStart(3, '0') }));
-  files.forEach((fp, i) => {
-    const u = entry.uploaded[fp];
-    videos.push({ client_media_path: u.client_media_path, episode_id: String(urls.length + i + 1).padStart(3, '0'), title: u.title, mime_type: u.mime_type, size_bytes: u.size_bytes });
-  });
-  console.log(`✓ 全部 ${videos.length} 个视频就绪，开始反推…`);
-  // 注意：--extra 是洗稿指令，只能进 auto_rewrite，绝不能当视频分析 prompt——否则
-  // 视频模型会照着洗稿指令"分析"(如把画面里的柚子直接分析成西瓜)，污染忠实反推。
-  // 视频分析要忠实描述原视频；真需要分析指引用 --analysis-note（默认空=纯忠实反推）。
-  const analysisNote = arg('analysis-note', '');
-  await api(`/api/projects/${pid}/video-reverse/start`, { method: 'POST', body: { videos, auto_start_workflow: true, ...(analysisNote ? { prompt: analysisNote } : {}) } });
-  entry.started = true; saveVideoManifest(manifest);
-  if (market) console.log(`✓ 已开始反推，完成后自动洗成《${MARKETS[market]}》剧本（时长跟随源视频，${count} 集）`);
-  else console.log('✓ 已开始反推成剧本稿（未选 --market，不自动洗稿；反推稿可在网页「剧本洗稿·选历史项目」里用）');
-  console.log(`下一步: chenyu-pro status --project ${pid.slice(-8)} --watch  盯反推${market ? '+洗稿' : ''}进度`);
-}
-
 async function findProject(fragment) {
   const data = await api('/api/projects');
   const list = data.projects || [];
@@ -520,37 +261,6 @@ async function cmdStatus() {
     }
     await new Promise((r) => setTimeout(r, 30000));
   }
-}
-
-// 续跑已暂停的项目（首批完成后平台会 paused 等确认）。走平台 start-auto 从
-// 已完成集之后继续，绝不重扣已生成的集，也绝不该由你手写后续集。范围三选一：
-// 默认续下一批(平台默认3集) / --episodes N 再跑指定 N 集 / --full 一次跑完剩余全部。
-async function cmdContinue() {
-  const fragment = arg('project') || die('缺 --project <id片段或剧名>');
-  const p = await findProject(fragment);
-  const done = Number(p.completed_episodes || 0);
-  const total = Number(p.total_episodes || 0);
-  if (['running', 'processing', 'queued'].includes(String(p.status))) {
-    console.log(`《${p.title}》正在跑（${p.status}，${done}/${total}），无需重复触发。用 status --watch 盯进度。`);
-    return;
-  }
-  if (total && done >= total) { console.log(`《${p.title}》已全部完成 ${done}/${total}，无需继续。用 fetch 取稿。`); return; }
-  const remaining = total ? total - done : 0;
-  // 三种续跑范围：--episodes N 指定几集 > --full 剩余全部 > 默认下一批(平台默认3集)。
-  const wantN = Math.max(0, Math.floor(Number(arg('episodes', '')) || 0));
-  let body = {};
-  let scope = '下一批';
-  if (wantN > 0) {
-    const n = remaining > 0 ? Math.min(wantN, remaining) : wantN;
-    body = { episode_count: n };
-    scope = `${n} 集`;
-  } else if (flag('full') && remaining > 0) {
-    body = { episode_count: remaining };
-    scope = `剩余全部 ${remaining} 集`;
-  }
-  await api(`/api/projects/${p.id}/workflow/start-auto`, { method: 'POST', body });
-  console.log(`✓ 已继续《${p.title}》：从第 ${done + 1} 集起（${scope}）。用 status --watch 盯进度，完成后 fetch 取稿。`);
-  if (flag('watch')) { process.argv.push('--project', fragment, '--watch'); await cmdStatus(); }
 }
 
 async function cmdFetch() {
@@ -591,37 +301,224 @@ async function cmdProjects() {
   }
 }
 
+// ---------- 格式门（v2.2.0）：确定性剧本质量校验，纯本地正则、零模型调用 ----------
+// 解决的核心问题：对白连发段（连续多句台词之间没有动作行）转分镜后人物干站着
+// 轮流念台词，成片生硬。规则全部确定性可数，Agent 写完循环过门直到 GATE_PASS。
+
+const GATE_MENTAL_RE = /心想|心中[想道]|心里[想暗默]|暗想|暗自[想道]|内心[想os]|回忆起|想起了|感到|觉得/;
+const isSceneHead = (l) => /^\d+-\d+\s+\S/.test(l);
+const isEpTitle = (l) => /^第\d+集/.test(l);
+const isActionLine = (l) => l.startsWith('△') || l.startsWith('▲');
+const isMetaLine = (l) => /^【(画面|运镜|音效|字幕|转场|特效)】/.test(l);
+const matchDialogue = (l) => {
+  if (isActionLine(l) || isMetaLine(l) || isSceneHead(l) || isEpTitle(l)) return null;
+  const m = l.match(/^([^\s：:△▲【\d][^：:]{0,9})(（[^）]*）|\([^)]*\))?[：:](.+)$/);
+  return m ? { speaker: m[1].trim(), body: m[3].trim() } : null;
+};
+
+// 校验一份正文，返回 { errors: [], warnings: [], stats: {} }。行号从 1 开始。
+function gateOneScript(text) {
+  const rawLines = String(text).split(/\r?\n/);
+  const errors = [], warnings = [];
+  let dlgCount = 0, actCount = 0, silentBurstStart = -1;
+  let run = [];                 // 当前连续台词行 [{ line, speaker }]
+  const flushRun = () => {
+    if (run.length >= 3) {
+      const from = run[0].line, to = run[run.length - 1].line;
+      const speakers = [...new Set(run.map(r => r.speaker))];
+      // 补写位置：连发段中间（第 2 句台词之后）
+      const insertAfter = run[1].line;
+      errors.push(`第${from}-${to}行 对白连发段（连续${run.length}句台词无△动作行，说话人:${speakers.join('/')}）→ 在第${insertAfter}行后插入一行△（听者可见反应 或 说话人伴随动作）`);
+    }
+    run = [];
+  };
+  let narrativeCount = 0;   // 既非台词/△/元信息/场次头的叙述行（小说识别用）
+  for (let i = 0; i < rawLines.length; i++) {
+    const l = rawLines[i].trim();
+    const ln = i + 1;
+    if (!l) continue;
+    if (isActionLine(l)) {
+      flushRun();
+      actCount++;
+      const body = l.slice(1).trim();
+      if (GATE_MENTAL_RE.test(body)) errors.push(`第${ln}行 △写了心理活动（${(body.match(GATE_MENTAL_RE) || [''])[0]}）→ △只写可见的外部动作与神态，把心理翻译成身体反应`);
+      if (body.length < 6) warnings.push(`第${ln}行 △太短（${body.length}字）——动作要具体可拍`);
+      if (body.length > 60) warnings.push(`第${ln}行 △太长（${body.length}字）——一行一件事，拆开`);
+      continue;
+    }
+    if (isMetaLine(l) || isSceneHead(l) || isEpTitle(l)) { flushRun(); continue; }
+    const d = matchDialogue(l);
+    if (d) {
+      dlgCount++;
+      run.push({ line: ln, speaker: d.speaker });
+      if (d.body.length > 40) warnings.push(`第${ln}行 台词超长（${d.body.length}字）——超过40字的台词转分镜会被硬拆，建议按句号拆成两句`);
+      continue;
+    }
+    flushRun(); // 其他叙述行也算隔断
+    narrativeCount++;
+  }
+  flushRun();
+  // 小说/散文识别：绝大部分是叙述行、几乎没有剧本结构 → 这是源材料不是剧本，
+  // 逐条打补丁方向就错了，应整体改编成剧本格式后再过门。
+  const structured = dlgCount + actCount;
+  if (narrativeCount >= 30 && structured < narrativeCount * 0.25 && !rawLines.some(l => isSceneHead(l.trim()))) {
+    return {
+      errors: [`这份文本是小说/散文源材料（叙述行${narrativeCount}行，剧本结构行仅${structured}行），不是剧本——不要按下面的行号打补丁，请先把它改编成剧本格式（场次头 + △动作行 + 「角色名：台词」），改编稿再过门`],
+      warnings: [],
+      stats: { dialogue: dlgCount, action: actCount }
+    };
+  }
+  if (dlgCount === 0) errors.push('没有解析到任何台词行——检查格式：台词行应为「角色名：台词」');
+  if (dlgCount > 0 && actCount === 0) errors.push('全篇没有一行△动作行——每句台词前后应有可见动作/反应（目标配比约1:1）');
+  else if (dlgCount > 0 && dlgCount / Math.max(actCount, 1) > 2) warnings.push(`对白:动作 = ${dlgCount}:${actCount}（超过2:1）——目标约1:1，多补△（听者反应/说话人动作）`);
+  const hasScene = rawLines.some(l => isSceneHead(l.trim()));
+  if (!hasScene) warnings.push('没有场次头（如「1-1 面馆后厨 白天 室内」）——建议每场开头标场景/时间/内外');
+  return { errors, warnings, stats: { dialogue: dlgCount, action: actCount } };
+}
+
+// gate 命令：--file 单文件 / --dir 目录批量(.txt/.md)。跑门前仅做鉴权（不扣积分）。
+// 输出 GATE_PASS / GATE_FAIL(exit 1)。--no-auth 供离线自查（Agent 正式交付前仍须 auth）。
+async function cmdGate() {
+  if (!flag('no-auth')) await api('/api/auth/me');
+  const file = arg('file', '');
+  const dir = arg('dir', '');
+  const targets = [];
+  if (file) targets.push(path.resolve(file));
+  else if (dir) {
+    const d = path.resolve(dir);
+    if (!fs.existsSync(d)) die('目录不存在: ' + d);
+    for (const name of fs.readdirSync(d)) if (/\.(txt|md)$/i.test(name)) targets.push(path.join(d, name));
+    if (!targets.length) die('目录里没有 .txt/.md 剧本文件');
+  } else die('用法: chenyu-pro gate --file 剧本.txt  或  chenyu-pro gate --dir <目录>');
+  let totalErr = 0, totalWarn = 0;
+  for (const t of targets) {
+    if (!fs.existsSync(t)) die('文件不存在: ' + t);
+    const { errors, warnings, stats } = gateOneScript(fs.readFileSync(t, 'utf8'));
+    const name = path.basename(t);
+    console.log(`── ${name}  台词${stats.dialogue}句 / 动作${stats.action}行`);
+    for (const e of errors) console.log('  ✗ ' + e);
+    for (const w of warnings) console.log('  ⚠ ' + w);
+    if (!errors.length && !warnings.length) console.log('  ✓ 无问题');
+    totalErr += errors.length; totalWarn += warnings.length;
+  }
+  if (totalErr > 0) { console.log(`GATE_FAIL 硬伤${totalErr}处 警告${totalWarn}处 —— 按上面逐条修改后重跑 gate`); process.exit(1); }
+  console.log(`GATE_PASS${totalWarn ? ' （警告' + totalWarn + '处，建议顺手改）' : ''}`);
+}
+
+// ---------- Agent 写作模式（v2.0.0）：平台只做鉴权，写作由用户 Agent 完成，零积分 ----------
+
+// 鉴权门：Agent 动笔写剧本之前必须先跑本命令并拿到 AUTH_OK。
+// 只校验平台登录态（未登录会自动尝试 KEY 免密续登）；不查余额、不扣任何积分。
+// 退出码 0 = 通过；非 0 = 未通过（Agent 必须拒绝写作并引导用户登录）。
+async function cmdAuth() {
+  const me = await api('/api/auth/me');
+  const who = me.user?.display_name || me.user?.identifier || loadConfig().username || '(账号)';
+  console.log('AUTH_OK ' + who);
+}
+
+// 建项目壳（零积分）：只创建平台项目用于归档与交付，绝不调用 start-auto，
+// 平台服务端不会跑任何生成工作流、不会扣一分积分。正文由 Agent 写完后用 save 回传。
+async function cmdCreate() {
+  const title = arg('title') || die('缺 --title 剧名');
+  const episodes = Number(arg('episodes', '30'));
+  const market = arg('market', '');
+  if (market && !MARKETS[market]) die('未知市场: ' + market + '，可选: ' + Object.keys(MARKETS).join('/'));
+  const duration = Number(arg('duration', '90'));
+  const body = {
+    title, working_title: title,
+    mode: 'original',
+    total_episodes: episodes, batch_episodes: episodes,
+    quality_tier: 'strong_review',
+    episode_duration_seconds: duration,
+    config: {
+      genre: arg('genre', market ? MARKETS[market] : '短剧'),
+      audience: arg('audience', '待确认'),
+      production_format: '真人剧', source_type: 'source_text',
+      model_strategy: 'balanced', research_window_days: 30,
+      episode_duration_seconds: duration,
+      config_json: {
+        created_from: 'chenyu-pro-cli-agent',
+        authoring: 'agent',            // 标记：正文由用户 Agent 写作，非平台生成
+        ...(market ? { market } : {})
+      }
+    }
+  };
+  const created = await api('/api/projects', { method: 'POST', body });
+  const pid = created.project.id;
+  console.log('✓ 项目壳已创建（Agent 写作模式，零积分）: ' + pid);
+  console.log(`下一步: 你(Agent)按 SKILL 写作规范逐集写正文 → chenyu-pro save --project ${pid.slice(-8)} --episode 1 --file 第001集.txt`);
+}
+
+// 回传 Agent 写的正文：按平台 A15 正文产物契约入库（step_id=A15 / title 含"正文" /
+// episode=集号），入库后 fetch / sync / word / download-full 等交付链路直接可用。
+// 单集: --episode N --file 正文.txt   批量: --dir 目录(文件名须含 第N集)
+async function cmdSave() {
+  const fragment = arg('project') || die('缺 --project <id片段或剧名>');
+  const p = await findProject(fragment);
+  const dir = arg('dir', '');
+  const items = [];
+  if (dir) {
+    const d = path.resolve(dir);
+    if (!fs.existsSync(d)) die('目录不存在: ' + d);
+    for (const name of fs.readdirSync(d)) {
+      const m = name.match(/第(\d+)集/);
+      if (!m || !/\.(txt|md)$/i.test(name)) continue;
+      items.push({ ep: Number(m[1]), file: path.join(d, name) });
+    }
+    if (!items.length) die('目录里没有文件名含「第N集」的 .txt/.md 正文文件');
+    items.sort((a, b) => a.ep - b.ep);
+  } else {
+    const ep = Number(arg('episode', '')) || die('缺 --episode <集号>（或用 --dir 批量）');
+    const file = arg('file') || die('缺 --file <正文.txt>');
+    items.push({ ep, file: path.resolve(file) });
+  }
+  for (const it of items) {
+    if (!fs.existsSync(it.file)) die('正文文件不存在: ' + it.file);
+    const content = fs.readFileSync(it.file, 'utf8');
+    if (content.trim().length < 50) die(`正文太短(${it.file})——不像一集剧本`);
+    if (!flag('skip-gate')) {
+      const g = gateOneScript(content);
+      if (g.errors.length) {
+        for (const e of g.errors) console.log('  ✗ ' + e);
+        die(`${path.basename(it.file)} 未过格式门（${g.errors.length}处硬伤）——修完重跑，或 --skip-gate 强制入库`);
+      }
+    }
+    const pad = String(it.ep).padStart(3, '0');
+    const epTitle = arg('title', '');
+    await api(`/api/projects/${p.id}/files`, {
+      method: 'POST',
+      body: {
+        filename: `第${pad}集正文.md`,
+        title: epTitle ? `第${pad}集正文 ${epTitle}` : `第${pad}集正文`,
+        type: 'markdown',
+        step_id: 'A15',
+        episode: it.ep,
+        content
+      }
+    });
+    console.log(`  ✓ 第${pad}集正文已入库 (${content.length} 字)`);
+  }
+  console.log(`✓ 共回传 ${items.length} 集到《${p.title}》。交付: chenyu-pro fetch --project ${p.id.slice(-8)} --out <目录>  或  chenyu-pro sync --project ${p.id.slice(-8)}`);
+}
+
 function cmdVersion() {
   console.log(`chenyu-pro v${VERSION}`);
 }
 
 function cmdHelp() {
-  console.log(`辰屿 Pro CLI v${VERSION} —— 剧本生产平台命令行
+  console.log(`辰屿 Pro CLI v${VERSION} —— 剧本平台命令行（Agent 写作模式：平台只鉴权，写作零积分）
 
   chenyu-pro login --web                                   网页授权登录你的账号（推荐；项目归你账号，KEY 自动带出）
   chenyu-pro login --username <账号> --password <密码>     密码登录你的账号
   chenyu-pro key set <积分KEY> | key show                  仅绑积分 KEY（快速免密，但走独立身份）
   chenyu-pro credits                                       查用户名·余额
-  chenyu-pro estimate --episodes 30 [--director-cut]       预估消耗+余额校验
-  【B路·洗稿(照原剧情忠实换壳，集数1:1、不卡每集时长、逐集质量门)】
-  chenyu-pro submit --mode rewrite --title <剧名> --episodes 30 --market japan_ja \\
-      (--source 源剧本.txt | --from-project <反推母项目id片段>) \\
-      [--director-cut] [--extra "补充要求"] [--batch 3]
-      --from-project: 复用某个视频反推稿去洗"另一个市场版"(不重反推，省钱)
-      [--shots]: 加拍摄分镜层(画面/运镜/特效/转场)；默认纯剧本(场景+动作+对白，干净好读)
-  chenyu-pro submit --mode video (--video-url <链接> | --video-file <本地.mp4>) [--market us_en] \\
-      视频反推洗稿(B路)：先反推成剧本稿(另存母项目可复用)；带 --market 反推完自动洗稿(时长跟源视频)
-      --video-url 链接 / --video-file 本地文件(自动上传R2)；多个逗号分隔，可混用
-      本地文件有 ffmpeg 时自动压到 480p 再传(反推只用低清代理，快一个数量级；--no-compress 关)
-      大批量本地文件支持断点续传：中断后重跑同一条命令，自动跳过已传、只补未传
-  【A路·蓝图(原创 / 网文改编，剧本仅作参考再创作)】
-  chenyu-pro submit --mode original --title <剧名> --episodes 30 [--market us_en]   原创剧(走蓝图)
-  chenyu-pro submit --mode adaptation --title <剧名> --source 小说.txt [--market japan_ja]  网文改编(走蓝图)
-      --market: 原创/改编也能面向国外市场——蓝图与正文按目标市场名字/货币/称谓原生落地(不给=中文)
-      可选市场: us_en/latam_es/brazil_pt/japan_ja/korea_ko/thailand_th/vietnam_vi/indonesia_id
+  【Agent 写作模式（默认）：写作由你的 Agent 完成，不消耗平台积分，平台只做鉴权与交付】
+  chenyu-pro auth                                          鉴权门——Agent 动笔前必须通过(输出 AUTH_OK)
+  chenyu-pro create --title <剧名> --episodes 30 [--market us_en]   建项目壳(零积分，不触发平台生成)
+  chenyu-pro save --project <id片段> --episode 1 --file 第001集.txt  回传 Agent 写好的一集正文
+  chenyu-pro save --project <id片段> --dir <目录>          批量回传(文件名含 第N集 的 .txt/.md)
+  chenyu-pro gate --file 剧本.txt | --dir <目录>           格式门：确定性质量校验(对白连发/心理活动/超长台词)，改到 GATE_PASS
   chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
-  chenyu-pro continue --project <id片段|剧名> [--episodes N|--full] [--watch]  续跑(不重扣):
-                        默认下一批, --episodes 5 再跑5集, --full 剩余全部
   chenyu-pro fetch --project <id片段> --out <目录>          导出交付正文到本地
   chenyu-pro sync --project <id片段|剧名>                   同步到云端脚本库（辰屿客户端可下载）
   chenyu-pro projects                                      项目列表
@@ -630,5 +527,5 @@ function cmdHelp() {
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, estimate: cmdEstimate, submit: cmdSubmit, status: cmdStatus, continue: cmdContinue, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 await (commands[cmd] || cmdHelp)();
