@@ -6,7 +6,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { exec } from 'node:child_process';
+import { exec, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
 // v2.2.1 2026-08-31  gate 加小说/散文源材料识别：叙述行占绝对多数且无剧本结构时，
@@ -62,7 +62,12 @@ import { exec } from 'node:child_process';
 // v1.1.0 2026-07-13  KEY 自动免密登录(SSO)+401自动续登; fetch 选交付版正文
 //                    并剥步骤元数据; help 文案更新
 // v1.0.0 2026-07-12  首发: login/key/credits/estimate/submit/status/fetch/projects
-const VERSION = '2.2.1';
+// v2.3.0 2026-09-12  新增 video-analyze：视频分析是本 Skill 唯一消耗积分的功能。
+//                    只分析不代写(不传 auto_start_workflow / 不设 auto_rewrite)，
+//                    分析稿取回本地交给 Agent 自己写剧本(写作仍零积分)；
+//                    跑前先报价(30分/240秒段)，--yes 才执行。
+//                    Agent 自己能读懂视频时应自行分析，不调本命令。
+const VERSION = '2.3.0';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -501,6 +506,128 @@ async function cmdSave() {
   console.log(`✓ 共回传 ${items.length} 集到《${p.title}》。交付: chenyu-pro fetch --project ${p.id.slice(-8)} --out <目录>  或  chenyu-pro sync --project ${p.id.slice(-8)}`);
 }
 
+// ---------- 视频分析：本 Skill 唯一消耗平台积分的功能 ----------
+// 边界：平台只做「视频 → 分析稿」，绝不触发平台代写——不传 auto_start_workflow、
+// 不设 auto_rewrite。分析稿取回本地后由你(Agent)自己写剧本，写作零积分。
+// 能力优先：若你(Agent)本身能直接读懂视频，先自己分析，不要调本命令花积分。
+const VIDEO_MIME = { '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.mkv': 'video/x-matroska', '.webm': 'video/webm', '.avi': 'video/x-msvideo', '.m4v': 'video/x-m4v', '.ts': 'video/mp2t' };
+const guessVideoMime = (n) => VIDEO_MIME[path.extname(n).toLowerCase()] || 'video/mp4';
+const SEGMENT_SECONDS = 240;    // 平台按 240 秒切段（不足一段按一段算）
+const POINTS_PER_SEGMENT = 30;  // 每段 30 积分
+
+function probeDurationSeconds(file) {
+  const cands = [process.env.CHENYU_FFPROBE, 'ffprobe', 'C:\\ffmpeg\\bin\\ffprobe.exe', 'E:\\pump2.0\\BOTV\\FFPROBE.EXE'].filter(Boolean);
+  for (const bin of cands) {
+    try {
+      const r = spawnSync(bin, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', file], { windowsHide: true, encoding: 'utf8' });
+      if (r.status === 0) { const d = Number(String(r.stdout || '').trim()); if (d > 0) return d; }
+    } catch { /* 试下一个候选 */ }
+  }
+  return 0;
+}
+
+async function cmdVideoAnalyze() {
+  const files = arg('video-file', '').split(',').map((s) => s.trim()).filter(Boolean).map((s) => path.resolve(s));
+  const urls = arg('video-url', '').split(',').map((s) => s.trim()).filter((s) => /^https?:\/\//i.test(s));
+  if (!files.length && !urls.length) die('缺 --video-file <本地.mp4> 或 --video-url <链接>（多个用英文逗号分隔，可混用）');
+  for (const f of files) if (!fs.existsSync(f)) die('视频文件不存在: ' + f);
+
+  // ① 先报价：必须把预估积分告诉用户、得到同意后再加 --yes 重跑
+  let measured = 0, segments = 0, unknown = urls.length;
+  for (const f of files) {
+    const d = probeDurationSeconds(f);
+    if (d > 0) { measured += d; segments += Math.ceil(d / SEGMENT_SECONDS); } else unknown += 1;
+  }
+  console.log('— 视频分析计费（仅分析走平台积分；写作由你 Agent 完成，零积分）—');
+  if (segments) console.log(`  可测时长 ${Math.round(measured)} 秒 → ${segments} 段 x ${POINTS_PER_SEGMENT} 分 = 约 ${segments * POINTS_PER_SEGMENT} 分`);
+  if (unknown) console.log(`  另有 ${unknown} 个来源本地测不到时长，按 ${POINTS_PER_SEGMENT} 分 / ${SEGMENT_SECONDS} 秒计（不足一段按一段）`);
+  if (!flag('yes')) die('请先把上面的预估积分告诉用户，得到同意后加 --yes 重跑');
+
+  // ② 建 video_reverse 项目：不设 auto_rewrite，平台分析完不会接着洗稿
+  const count = files.length + urls.length;
+  const title = arg('title') || ('视频分析·' + new Date().toISOString().slice(0, 10));
+  const created = await api('/api/projects', { method: 'POST', body: {
+    title, working_title: title, mode: 'video_reverse',
+    total_episodes: count, batch_episodes: Math.min(3, count), quality_tier: 'strong_review',
+    config: {
+      genre: '短剧', audience: '待确认', production_format: '真人剧',
+      source_type: 'video_reverse_series', model_strategy: 'balanced',
+      config_json: { created_from: 'chenyu-pro-cli-agent', authoring: 'agent' }
+    }
+  } });
+  const pid = created.project?.id || created.id;
+  if (!pid) die('建项目失败');
+  console.log(`✓ 项目已建: ${pid.slice(-8)}  《${title}》`);
+
+  // ③ 上传本地视频（有界并发 4）
+  const uploaded = [];
+  let next = 0;
+  const uploadOne = async (i) => {
+    const fp = files[i];
+    const name = path.basename(fp);
+    const mime = guessVideoMime(name);
+    const size = fs.statSync(fp).size;
+    const signed = await api(`/api/projects/${pid}/client-media/signed-upload`, { method: 'POST', body: { kind: 'video', filename: name, mimeType: mime, size } });
+    const uploadUrl = signed.upload?.uploadUrl || signed.uploadUrl;
+    const mediaPath = signed.upload?.path || signed.path;
+    if (!uploadUrl || !mediaPath) die('获取视频上传地址失败: ' + name);
+    const put = await fetch(uploadUrl, { method: 'PUT', body: fs.readFileSync(fp), headers: { 'Content-Type': mime } });
+    if (!put.ok) die(`视频上传失败（HTTP ${put.status}）: ${name}`);
+    uploaded[i] = { client_media_path: mediaPath, title: name, mime_type: mime, size_bytes: size };
+    console.log(`  ✓ 已上传 ${name} (${(size / 1048576).toFixed(1)}MB)`);
+  };
+  await Promise.all(Array.from({ length: Math.min(4, files.length || 1) }, async () => {
+    for (let i = next++; i < files.length; i = next++) await uploadOne(i);
+  }));
+
+  // ④ 只分析：不传 auto_start_workflow，平台不会接着代写
+  const videos = urls.map((u, i) => ({ video_url: u, episode_id: String(i + 1).padStart(3, '0') }));
+  uploaded.forEach((u, i) => { if (u) videos.push({ ...u, episode_id: String(urls.length + i + 1).padStart(3, '0') }); });
+  const note = arg('analysis-note', '');
+  await api(`/api/projects/${pid}/video-reverse/start`, { method: 'POST', body: { videos, ...(note ? { prompt: note } : {}) } });
+  console.log(`✓ 已提交分析 ${videos.length} 个视频（仅分析，不代写）`);
+
+  // ⑤ 轮询到分析结束
+  const deadline = Date.now() + Number(arg('timeout-min', '90')) * 60000;
+  let lastMsg = '';
+  while (Date.now() < deadline) {
+    await sleep(15000);
+    const jobs = (await api(`/api/projects/${pid}/jobs`)).jobs || [];
+    const job = jobs.find((j) => String(j.type || '').includes('video_reverse')) || jobs[0];
+    if (!job) continue;
+    const st = String(job.status || '');
+    const msg = `${st} ${job.progress != null ? job.progress + '%' : ''} ${job.message || ''}`.trim();
+    if (msg !== lastMsg) { console.log('  … ' + msg); lastMsg = msg; }
+    if (['succeeded', 'completed', 'done'].includes(st)) break;
+    if (['failed', 'cancelled', 'error'].includes(st)) die('分析失败: ' + (job.message || st));
+  }
+
+  // ⑥ 取回分析稿交给 Agent
+  const outDir = path.resolve(arg('out', './chenyu-video-analysis'));
+  fs.mkdirSync(outDir, { recursive: true });
+  const arts = (await api(`/api/projects/${pid}/artifacts`)).artifacts || [];
+  const want = ['video_reverse_source.md', 'video_reverse_replay_script.md', 'episode_index.json', 'identity_registry.json'];
+  let got = 0;
+  for (const a of arts) {
+    const fn = String(a.filename || a.title || '');
+    if (!want.includes(fn)) continue;
+    let content = String(a.content || '');
+    if (!content) {
+      try { content = String((await api(`/api/artifacts/${a.id}/content`)).content || ''); } catch { /* 跳过取不到的 */ }
+    }
+    if (!content.trim()) continue;
+    fs.writeFileSync(path.join(outDir, fn), content, 'utf8');
+    got += 1;
+  }
+  if (!got) {
+    console.log(`⚠ 分析已结束但未取到分析稿，用 chenyu-pro status --project ${pid.slice(-8)} 复查`);
+    return;
+  }
+  console.log(`✓ 分析稿已取回 ${got} 个文件 -> ${outDir}`);
+  console.log('  下一步（零积分）：你(Agent)读 video_reverse_source.md，按 SKILL 写作规范自己写剧本，');
+  console.log(`  过 gate 后 chenyu-pro save --project ${pid.slice(-8)} --episode N --file 第00N集.txt`);
+}
+
 function cmdVersion() {
   console.log(`chenyu-pro v${VERSION}`);
 }
@@ -522,10 +649,15 @@ function cmdHelp() {
   chenyu-pro fetch --project <id片段> --out <目录>          导出交付正文到本地
   chenyu-pro sync --project <id片段|剧名>                   同步到云端脚本库（辰屿客户端可下载）
   chenyu-pro projects                                      项目列表
+  【视频分析——本 Skill 唯一消耗积分的功能】
+  chenyu-pro video-analyze --video-file a.mp4,b.mp4 [--yes]  视频→分析稿(只分析不代写)
+  chenyu-pro video-analyze --video-url <链接> [--out <目录>]  计费: ${POINTS_PER_SEGMENT} 分 / ${SEGMENT_SECONDS} 秒段(不足一段按一段)
+    不加 --yes 只报价不执行；分析稿取回后由你(Agent)自己写剧本，写作零积分。
+    若你(Agent)本身能直接读懂视频，请自己分析，不要调本命令花积分。
 
   市场: ${Object.entries(MARKETS).map(([k, v]) => k + '=' + v).join(' ')}
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, 'video-analyze': cmdVideoAnalyze, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 await (commands[cmd] || cmdHelp)();
