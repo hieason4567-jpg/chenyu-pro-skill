@@ -9,6 +9,8 @@ import os from 'node:os';
 import { exec, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.3.3 2026-09-13  video-analyze 打印实际扣除(分析前后余额差)对比报价；平台部分段失败(needs_review)
+//                    时照常取回已完成的分析稿，不再当整批失败（配合平台修复重复扣分/单段拖垮整批）。
 // v2.3.2 2026-09-13  gate 堵机械转换：同一句△重复出现(把分析表 visible_action 复制到每句台词前)
 //                    与万能填充句(话题继续推进/接住话头…)判 GATE_FAIL；SKILL 补"分析表→剧本"写法。
 // v2.2.1 2026-08-31  gate 加小说/散文源材料识别：叙述行占绝对多数且无剧本结构时，
@@ -71,7 +73,7 @@ import { exec, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.3.2';
+const VERSION = '2.3.3';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -545,6 +547,17 @@ function probeDurationSeconds(file) {
   return 0;
 }
 
+// 查余额但不中断流程（用于对比实际扣除），取不到返回 null。
+async function pointsBalanceSafe() {
+  try {
+    const cfg = loadConfig();
+    if (!cfg.credit_key) return null;
+    const res = await fetch((cfg.credit_base || DEFAULT_CREDIT_BASE) + '/api/jimeng/v1/key', { headers: { Authorization: 'Bearer ' + cfg.credit_key } });
+    const n = Number((await res.json().catch(() => ({})))?.key?.pointsBalance);
+    return Number.isFinite(n) ? n : null;
+  } catch { return null; }
+}
+
 async function cmdVideoAnalyze() {
   const files = arg('video-file', '').split(',').map((s) => s.trim()).filter(Boolean).map((s) => path.resolve(s));
   const urls = arg('video-url', '').split(',').map((s) => s.trim()).filter((s) => /^https?:\/\//i.test(s));
@@ -561,6 +574,14 @@ async function cmdVideoAnalyze() {
   if (segments) console.log(`  可测时长 ${Math.round(measured)} 秒 → ${segments} 段 x ${POINTS_PER_SEGMENT} 分 = 约 ${segments * POINTS_PER_SEGMENT} 分`);
   if (unknown) console.log(`  另有 ${unknown} 个来源本地测不到时长，按 ${POINTS_PER_SEGMENT} 分 / ${SEGMENT_SECONDS} 秒计（不足一段按一段）`);
   if (!flag('yes')) die('请先把上面的预估积分告诉用户，得到同意后加 --yes 重跑');
+  const quoted = (segments + unknown) * POINTS_PER_SEGMENT;
+  const balanceBefore = await pointsBalanceSafe();
+  const reportCharge = async () => {
+    const after = await pointsBalanceSafe();
+    if (balanceBefore == null || after == null) return;
+    const spent = balanceBefore - after;
+    console.log(`  实际扣除 ${spent} 分（报价约 ${quoted} 分）${spent > quoted ? ' ⚠ 超出报价，请把这条原样告诉用户并反馈平台' : ''}`);
+  };
 
   // ② 建 video_reverse 项目：不设 auto_rewrite，平台分析完不会接着洗稿
   const count = files.length + urls.length;
@@ -609,16 +630,19 @@ async function cmdVideoAnalyze() {
   // ⑤ 轮询到分析结束
   const deadline = Date.now() + Number(arg('timeout-min', '90')) * 60000;
   let lastMsg = '';
+  let partial = '';
   while (Date.now() < deadline) {
     await sleep(15000);
     const jobs = (await api(`/api/projects/${pid}/jobs`)).jobs || [];
-    const job = jobs.find((j) => String(j.type || '').includes('video_reverse')) || jobs[0];
+    const job = jobs.find((j) => String(j.type || j.job_type || '').includes('video_reverse')) || jobs[0];
     if (!job) continue;
     const st = String(job.status || '');
     const msg = `${st} ${job.progress != null ? job.progress + '%' : ''} ${job.message || ''}`.trim();
     if (msg !== lastMsg) { console.log('  … ' + msg); lastMsg = msg; }
     if (['succeeded', 'completed', 'done'].includes(st)) break;
-    if (['failed', 'cancelled', 'error'].includes(st)) die('分析失败: ' + (job.message || st));
+    // needs_review = 部分段未完成或需复核：已完成的段照常取回，不整批重交（重交会对已成功段重复扣分）。
+    if (st === 'needs_review') { partial = job.message || st; break; }
+    if (['failed', 'cancelled', 'error'].includes(st)) { await reportCharge(); die('分析失败: ' + (job.message || st)); }
   }
 
   // ⑥ 取回分析稿交给 Agent
@@ -638,11 +662,13 @@ async function cmdVideoAnalyze() {
     fs.writeFileSync(path.join(outDir, fn), content, 'utf8');
     got += 1;
   }
+  await reportCharge();
   if (!got) {
     console.log(`⚠ 分析已结束但未取到分析稿，用 chenyu-pro status --project ${pid.slice(-8)} 复查`);
     return;
   }
   console.log(`✓ 分析稿已取回 ${got} 个文件 -> ${outDir}`);
+  if (partial) console.log(`⚠ 部分内容需复核：${partial}\n  已完成的段已取回；不要整批重新提交（会对已成功的段重复扣分），把缺的集告诉用户。`);
   console.log('  下一步（零积分）：你(Agent)读 video_reverse_source.md，按 SKILL 写作规范自己写剧本，');
   console.log(`  过 gate 后 chenyu-pro save --project ${pid.slice(-8)} --episode N --file 第00N集.txt`);
 }
