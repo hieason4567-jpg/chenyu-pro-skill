@@ -9,6 +9,8 @@ import os from 'node:os';
 import { exec, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.3.4 2026-09-13  needs_review 区分：无失败段=分析完整(仅人物身份门未过，单包必出)，不再提示复核、
+//                    避免 Agent 误以为缺内容而重交扣分；有失败段才列出缺哪几段。
 // v2.3.3 2026-09-13  video-analyze 打印实际扣除(分析前后余额差)对比报价；平台部分段失败(needs_review)
 //                    时照常取回已完成的分析稿，不再当整批失败（配合平台修复重复扣分/单段拖垮整批）。
 // v2.3.2 2026-09-13  gate 堵机械转换：同一句△重复出现(把分析表 visible_action 复制到每句台词前)
@@ -73,7 +75,7 @@ import { exec, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.3.3';
+const VERSION = '2.3.4';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -631,6 +633,7 @@ async function cmdVideoAnalyze() {
   const deadline = Date.now() + Number(arg('timeout-min', '90')) * 60000;
   let lastMsg = '';
   let partial = '';
+  let identityOnly = false;
   while (Date.now() < deadline) {
     await sleep(15000);
     const jobs = (await api(`/api/projects/${pid}/jobs`)).jobs || [];
@@ -641,7 +644,15 @@ async function cmdVideoAnalyze() {
     if (msg !== lastMsg) { console.log('  … ' + msg); lastMsg = msg; }
     if (['succeeded', 'completed', 'done'].includes(st)) break;
     // needs_review = 部分段未完成或需复核：已完成的段照常取回，不整批重交（重交会对已成功段重复扣分）。
-    if (st === 'needs_review') { partial = job.message || st; break; }
+    if (st === 'needs_review') {
+      let rj = job.result_json || {};
+      if (typeof rj === 'string') { try { rj = JSON.parse(rj); } catch { rj = {}; } }
+      const failed = Array.isArray(rj.failed_segments) ? rj.failed_segments : [];
+      // 没有失败段 = 分析完整，只是平台自动改编用的人物身份门没过（单包项目几乎必出），不是缺内容。
+      if (failed.length) partial = `未完成的段: ${failed.map((f) => f.segment_id).join(', ')}`;
+      else identityOnly = true;
+      break;
+    }
     if (['failed', 'cancelled', 'error'].includes(st)) { await reportCharge(); die('分析失败: ' + (job.message || st)); }
   }
 
@@ -668,7 +679,8 @@ async function cmdVideoAnalyze() {
     return;
   }
   console.log(`✓ 分析稿已取回 ${got} 个文件 -> ${outDir}`);
-  if (partial) console.log(`⚠ 部分内容需复核：${partial}\n  已完成的段已取回；不要整批重新提交（会对已成功的段重复扣分），把缺的集告诉用户。`);
+  if (partial) console.log(`⚠ 部分段未完成：${partial}\n  已完成的段已取回；不要整批重新提交（会对已成功的段重复扣分），把缺的集告诉用户。`);
+  if (identityOnly) console.log('ℹ 分析完整。平台标记"人物身份待核"（单包分析常见，不是缺内容）——写作时按分析稿人物表统一称呼即可，无需重交。');
   console.log('  下一步（零积分）：你(Agent)读 video_reverse_source.md，按 SKILL 写作规范自己写剧本，');
   console.log(`  过 gate 后 chenyu-pro save --project ${pid.slice(-8)} --episode N --file 第00N集.txt`);
 }
