@@ -67,7 +67,9 @@ import { exec, spawnSync } from 'node:child_process';
 //                    分析稿取回本地交给 Agent 自己写剧本(写作仍零积分)；
 //                    跑前先报价(30分/240秒段)，--yes 才执行。
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
-const VERSION = '2.3.0';
+// v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
+//                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
+const VERSION = '2.3.1';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -509,7 +511,8 @@ async function cmdSave() {
 // ---------- 视频分析：本 Skill 唯一消耗平台积分的功能 ----------
 // 边界：平台只做「视频 → 分析稿」，绝不触发平台代写——不传 auto_start_workflow、
 // 不设 auto_rewrite。分析稿取回本地后由你(Agent)自己写剧本，写作零积分。
-// 能力优先：若你(Agent)本身能直接读懂视频，先自己分析，不要调本命令花积分。
+// 视频一律走本命令做平台反推（画面+声音）；禁止 Agent 用抽音频/转写/抽帧代替，
+// 只有台词没有画面动作，洗出的剧本乱、改动大（2026-09-13 用户实测反馈）。
 const VIDEO_MIME = { '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.mkv': 'video/x-matroska', '.webm': 'video/webm', '.avi': 'video/x-msvideo', '.m4v': 'video/x-m4v', '.ts': 'video/mp2t' };
 const guessVideoMime = (n) => VIDEO_MIME[path.extname(n).toLowerCase()] || 'video/mp4';
 const SEGMENT_SECONDS = 240;    // 平台按 240 秒切段（不足一段按一段算）
@@ -653,7 +656,7 @@ function cmdHelp() {
   chenyu-pro video-analyze --video-file a.mp4,b.mp4 [--yes]  视频→分析稿(只分析不代写)
   chenyu-pro video-analyze --video-url <链接> [--out <目录>]  计费: ${POINTS_PER_SEGMENT} 分 / ${SEGMENT_SECONDS} 秒段(不足一段按一段)
     不加 --yes 只报价不执行；分析稿取回后由你(Agent)自己写剧本，写作零积分。
-    若你(Agent)本身能直接读懂视频，请自己分析，不要调本命令花积分。
+    视频一律用本命令做反推；不要用抽音频/转写/抽帧代替(只有台词没画面,剧本会乱)。
 
   市场: ${Object.entries(MARKETS).map(([k, v]) => k + '=' + v).join(' ')}
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
