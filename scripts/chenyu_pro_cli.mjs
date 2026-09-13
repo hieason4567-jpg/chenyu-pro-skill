@@ -9,6 +9,8 @@ import os from 'node:os';
 import { exec, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.3.5 2026-09-13  gate：△时间码判错、剥时间码再查重、占位话黑名单（"原视频动作…按画面同步保留"）；
+//                    video-analyze 逐段检查分析质量，镜头表0行/有质量标记的段 ⛔ 提示停写、告知用户。
 // v2.3.4 2026-09-13  needs_review 区分：无失败段=分析完整(仅人物身份门未过，单包必出)，不再提示复核、
 //                    避免 Agent 误以为缺内容而重交扣分；有失败段才列出缺哪几段。
 // v2.3.3 2026-09-13  video-analyze 打印实际扣除(分析前后余额差)对比报价；平台部分段失败(needs_review)
@@ -75,7 +77,7 @@ import { exec, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.3.4';
+const VERSION = '2.3.5';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -320,7 +322,9 @@ async function cmdProjects() {
 
 const GATE_MENTAL_RE = /心想|心中[想道]|心里[想暗默]|暗想|暗自[想道]|内心[想os]|回忆起|想起了|感到|觉得/;
 // 万能填充句（v2.3.2）：Agent 为凑 1:1 配比批量插的空洞△，不描述任何具体可拍动作。
-const GATE_FILLER_RE = /话题继续推进|接住话头|抬眼回应|短暂停顿，另一方|对话继续|继续交谈|继续对话|气氛继续|场面继续/;
+const GATE_FILLER_RE = /话题继续推进|接住话头|抬眼回应|短暂停顿，另一方|对话继续|继续交谈|继续对话|气氛继续|场面继续|按画面同步|同步保留|原视频动作|原视频画面|参考原视频|见原视频|动作同上|同上动作|按原片|保留原动作/;
+// △ 开头的时间码（[00:28-00:31] / 00:28-00:31）：剧本不写时间码；查重复前也要先剥掉，否则同一句占位话带不同时间码会逃过查重。
+const GATE_TIMECODE_RE = /^\s*[\[【(（]?\s*\d{1,2}:\d{2}(?::\d{2})?\s*[-~–—至到]\s*\d{1,2}:\d{2}(?::\d{2})?\s*[\]】)）]?\s*/;
 const isSceneHead = (l) => /^\d+-\d+\s+\S/.test(l);
 const isEpTitle = (l) => /^第\d+集/.test(l);
 const isActionLine = (l) => l.startsWith('△') || l.startsWith('▲');
@@ -358,8 +362,9 @@ function gateOneScript(text) {
       actCount++;
       const body = l.slice(1).trim();
       if (GATE_MENTAL_RE.test(body)) errors.push(`第${ln}行 △写了心理活动（${(body.match(GATE_MENTAL_RE) || [''])[0]}）→ △只写可见的外部动作与神态，把心理翻译成身体反应`);
-      if (GATE_FILLER_RE.test(body)) errors.push(`第${ln}行 △是万能填充句（${(body.match(GATE_FILLER_RE) || [''])[0]}）→ 写该时刻具体谁做了什么可见动作，不要用空话凑配比`);
-      const key = body.replace(/[。．.！!？?，,；;\s]+$/u, '');
+      if (GATE_TIMECODE_RE.test(body)) errors.push(`第${ln}行 △里写了时间码（${(body.match(GATE_TIMECODE_RE) || [''])[0].trim()}）→ 剧本不写时间码，删掉，直接写可见动作`);
+      if (GATE_FILLER_RE.test(body)) errors.push(`第${ln}行 △是万能填充句/占位话（${(body.match(GATE_FILLER_RE) || [''])[0]}）→ 写该时刻具体谁做了什么可见动作（分析表 visible_action 那一列就是素材），不要用空话占位`);
+      const key = body.replace(GATE_TIMECODE_RE, '').replace(/[。．.！!？?，,；;\s]+$/u, '');
       if (!actionSeen.has(key)) actionSeen.set(key, []);
       actionSeen.get(key).push(ln);
       if (body.length < 6) warnings.push(`第${ln}行 △太短（${body.length}字）——动作要具体可拍`);
@@ -673,7 +678,24 @@ async function cmdVideoAnalyze() {
     fs.writeFileSync(path.join(outDir, fn), content, 'utf8');
     got += 1;
   }
+  // 逐段查分析质量：平台对格式有问题的段只标记不重跑（避免重复扣分），残缺稿必须拦在 Agent 写作之前。
+  const badSegments = [];
+  for (const a of arts) {
+    const fn = String(a.filename || a.title || '');
+    if (!/^video_reverse_segment_.+\.json$/.test(fn)) continue;
+    try {
+      let content = String(a.content || '');
+      if (!content) content = String((await api(`/api/artifacts/${a.id}/content`)).content || '');
+      const seg = JSON.parse(content);
+      const rows = Array.isArray(seg.shot_rows) ? seg.shot_rows.length : 0;
+      const flags = Array.isArray(seg.quality_flags) ? seg.quality_flags : [];
+      if (!rows || flags.length) badSegments.push(`${seg.segment?.segment_id || fn}（镜头表${rows}行${flags.length ? '，' + String(flags[0]).slice(0, 40) : ''}）`);
+    } catch { /* 取不到单段文件不影响主流程 */ }
+  }
   await reportCharge();
+  if (badSegments.length) {
+    console.log(`⛔ 以下段分析稿不完整（缺画面动作/镜头表）：\n  ${badSegments.join('\n  ')}\n  不要据此写作、不要用占位话凑 △——先原样告诉用户，由平台核实后重跑或退分。`);
+  }
   if (!got) {
     console.log(`⚠ 分析已结束但未取到分析稿，用 chenyu-pro status --project ${pid.slice(-8)} 复查`);
     return;
