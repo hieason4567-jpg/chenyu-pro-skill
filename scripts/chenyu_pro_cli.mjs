@@ -9,6 +9,8 @@ import os from 'node:os';
 import { exec, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.3.2 2026-09-13  gate 堵机械转换：同一句△重复出现(把分析表 visible_action 复制到每句台词前)
+//                    与万能填充句(话题继续推进/接住话头…)判 GATE_FAIL；SKILL 补"分析表→剧本"写法。
 // v2.2.1 2026-08-31  gate 加小说/散文源材料识别：叙述行占绝对多数且无剧本结构时，
 //                    不再按行号误导打补丁，直接提示先改编成剧本格式再过门。
 // v2.2.0 2026-08-31  新增 gate 格式门：确定性剧本质量校验（纯本地正则，零模型调用，
@@ -69,7 +71,7 @@ import { exec, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.3.1';
+const VERSION = '2.3.2';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -313,6 +315,8 @@ async function cmdProjects() {
 // 轮流念台词，成片生硬。规则全部确定性可数，Agent 写完循环过门直到 GATE_PASS。
 
 const GATE_MENTAL_RE = /心想|心中[想道]|心里[想暗默]|暗想|暗自[想道]|内心[想os]|回忆起|想起了|感到|觉得/;
+// 万能填充句（v2.3.2）：Agent 为凑 1:1 配比批量插的空洞△，不描述任何具体可拍动作。
+const GATE_FILLER_RE = /话题继续推进|接住话头|抬眼回应|短暂停顿，另一方|对话继续|继续交谈|继续对话|气氛继续|场面继续/;
 const isSceneHead = (l) => /^\d+-\d+\s+\S/.test(l);
 const isEpTitle = (l) => /^第\d+集/.test(l);
 const isActionLine = (l) => l.startsWith('△') || l.startsWith('▲');
@@ -340,6 +344,7 @@ function gateOneScript(text) {
     run = [];
   };
   let narrativeCount = 0;   // 既非台词/△/元信息/场次头的叙述行（小说识别用）
+  const actionSeen = new Map(); // △正文 → 出现行号（重复△检测）
   for (let i = 0; i < rawLines.length; i++) {
     const l = rawLines[i].trim();
     const ln = i + 1;
@@ -349,6 +354,10 @@ function gateOneScript(text) {
       actCount++;
       const body = l.slice(1).trim();
       if (GATE_MENTAL_RE.test(body)) errors.push(`第${ln}行 △写了心理活动（${(body.match(GATE_MENTAL_RE) || [''])[0]}）→ △只写可见的外部动作与神态，把心理翻译成身体反应`);
+      if (GATE_FILLER_RE.test(body)) errors.push(`第${ln}行 △是万能填充句（${(body.match(GATE_FILLER_RE) || [''])[0]}）→ 写该时刻具体谁做了什么可见动作，不要用空话凑配比`);
+      const key = body.replace(/[。．.！!？?，,；;\s]+$/u, '');
+      if (!actionSeen.has(key)) actionSeen.set(key, []);
+      actionSeen.get(key).push(ln);
       if (body.length < 6) warnings.push(`第${ln}行 △太短（${body.length}字）——动作要具体可拍`);
       if (body.length > 60) warnings.push(`第${ln}行 △太长（${body.length}字）——一行一件事，拆开`);
       continue;
@@ -374,6 +383,13 @@ function gateOneScript(text) {
       warnings: [],
       stats: { dialogue: dlgCount, action: actCount }
     };
+  }
+  // 重复△：把视频分析表同一行的 visible_action 复制到每句台词前凑配比，成片动作全是同一句。
+  for (const [key, lines] of actionSeen) {
+    if (lines.length < 2) continue;
+    const msg = `第${lines.join('/')}行 △重复同一句（${key.slice(0, 24)}${key.length > 24 ? '…' : ''}）→ 每处△要写该时刻不同的具体动作/反应；分析表里一句概括只能用一次，拆成不同动作节拍`;
+    if (key.length >= 10 || lines.length >= 3) errors.push(msg);
+    else warnings.push(msg);
   }
   if (dlgCount === 0) errors.push('没有解析到任何台词行——检查格式：台词行应为「角色名：台词」');
   if (dlgCount > 0 && actCount === 0) errors.push('全篇没有一行△动作行——每句台词前后应有可见动作/反应（目标配比约1:1）');
