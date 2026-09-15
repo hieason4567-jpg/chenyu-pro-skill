@@ -9,6 +9,7 @@ import os from 'node:os';
 import { exec, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.3.6 2026-09-15  gate：补非△行整片时间轴/"按源视频"整片时长/"场景0XX"流水号检测(判 GATE_FAIL)。
 // v2.3.5 2026-09-13  gate：△时间码判错、剥时间码再查重、占位话黑名单（"原视频动作…按画面同步保留"）；
 //                    video-analyze 逐段检查分析质量，镜头表0行/有质量标记的段 ⛔ 提示停写、告知用户。
 // v2.3.4 2026-09-13  needs_review 区分：无失败段=分析完整(仅人物身份门未过，单包必出)，不再提示复核、
@@ -77,7 +78,7 @@ import { exec, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.3.5';
+const VERSION = '2.3.6';
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -325,6 +326,9 @@ const GATE_MENTAL_RE = /心想|心中[想道]|心里[想暗默]|暗想|暗自[�
 const GATE_FILLER_RE = /话题继续推进|接住话头|抬眼回应|短暂停顿，另一方|对话继续|继续交谈|继续对话|气氛继续|场面继续|按画面同步|同步保留|原视频动作|原视频画面|参考原视频|见原视频|动作同上|同上动作|按原片|保留原动作/;
 // △ 开头的时间码（[00:28-00:31] / 00:28-00:31）：剧本不写时间码；查重复前也要先剥掉，否则同一句占位话带不同时间码会逃过查重。
 const GATE_TIMECODE_RE = /^\s*[\[【(（]?\s*\d{1,2}:\d{2}(?::\d{2})?\s*[-~–—至到]\s*\d{1,2}:\d{2}(?::\d{2})?\s*[\]】)）]?\s*/;
+// 非△行的整片时间轴/源视频残留（v2.3.6）：`时长：X秒（按源视频）`、`【场景｜场景033】`流水号、行内 mm:ss-mm:ss——
+// 这些是视频反推分析稿的中间态，不该出现在剧本。单SHOT时长"（时长3秒）"不含冒号时间，不误伤；场次头 1-1 也不匹配。
+const GATE_TIMELEAK_RE = /\d{1,2}[:：]\d{2}\s*[-~–—至到]\s*\d{1,2}[:：]\d{2}|按源视频|场景\d{2,}/;
 const isSceneHead = (l) => /^\d+-\d+\s+\S/.test(l);
 const isEpTitle = (l) => /^第\d+集/.test(l);
 const isActionLine = (l) => l.startsWith('△') || l.startsWith('▲');
@@ -357,6 +361,7 @@ function gateOneScript(text) {
     const l = rawLines[i].trim();
     const ln = i + 1;
     if (!l) continue;
+    if (!isActionLine(l) && GATE_TIMELEAK_RE.test(l)) errors.push(`第${ln}行 残留整片时间轴/源视频标记（${(l.match(GATE_TIMELEAK_RE) || [''])[0]}）→ 删掉"按源视频"整片时长/"场景0XX"流水号/绝对时间轴；场景写真实地名，要时长只留单SHOT（时长3秒）`);
     if (isActionLine(l)) {
       flushRun();
       actCount++;
