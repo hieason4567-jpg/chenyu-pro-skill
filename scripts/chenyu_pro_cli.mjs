@@ -9,6 +9,8 @@ import os from 'node:os';
 import { exec, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.3.7 2026-09-16  所有请求带 User-Agent `chenyu-pro-cli/<版本> node/<版本>`，平台日志可识别
+//                    客户在跑哪一版 CLI（排查改包版/旧版用）。不改任何业务行为。
 // v2.3.6 2026-09-15  gate：补非△行整片时间轴/"按源视频"整片时长/"场景0XX"流水号检测(判 GATE_FAIL)。
 // v2.3.5 2026-09-13  gate：△时间码判错、剥时间码再查重、占位话黑名单（"原视频动作…按画面同步保留"）；
 //                    video-analyze 逐段检查分析质量，镜头表0行/有质量标记的段 ⛔ 提示停写、告知用户。
@@ -78,7 +80,9 @@ import { exec, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.3.6';
+const VERSION = '2.3.7';
+// 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
+const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -117,12 +121,12 @@ async function ssoLoginWithKey() {
   try {
     const tk = await fetch((cfg.credit_base || DEFAULT_CREDIT_BASE) + '/api/v1/sso/ticket', {
       method: 'POST',
-      headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' }
+      headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json', 'User-Agent': CLI_UA }
     }).then((r) => r.json());
     if (!tk?.ticket) return false;
     const login = await fetch((cfg.platform_base || DEFAULT_PLATFORM) + '/api/auth/sso-login', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'User-Agent': CLI_UA },
       body: JSON.stringify({ ticket: tk.ticket })
     }).then((r) => r.json());
     if (!login?.token) return false;
@@ -137,7 +141,7 @@ async function ssoLoginWithKey() {
 async function api(pathName, { method = 'GET', body, auth = true, base, _retried = false } = {}) {
   let cfg = loadConfig();
   const url = (base || cfg.platform_base || DEFAULT_PLATFORM) + pathName;
-  const headers = { 'Content-Type': 'application/json' };
+  const headers = { 'Content-Type': 'application/json', 'User-Agent': CLI_UA };
   if (auth) {
     if (!cfg.session_token) {
       const ok = await ssoLoginWithKey();
@@ -163,7 +167,7 @@ async function creditApi(pathName) {
   const cfg = loadConfig();
   const key = cfg.credit_key || '';
   if (!key) die('未绑定积分 KEY——先运行: chenyu-pro key set <你的KEY>');
-  const res = await fetch((cfg.credit_base || DEFAULT_CREDIT_BASE) + pathName, { headers: { Authorization: 'Bearer ' + key } });
+  const res = await fetch((cfg.credit_base || DEFAULT_CREDIT_BASE) + pathName, { headers: { Authorization: 'Bearer ' + key, 'User-Agent': CLI_UA } });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.success === false) die(`积分查询失败(${res.status}): ${data.error || ''}`);
   return data;
@@ -194,7 +198,7 @@ async function cmdLogin() {
   // 网页授权（推荐）：以你的真账号登录，项目归网页账号，KEY 自动带出。
   if (flag('web')) {
     const base = arg('base', loadConfig().platform_base || DEFAULT_PLATFORM);
-    const start = await fetch(base + '/api/auth/cli/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then((r) => r.json());
+    const start = await fetch(base + '/api/auth/cli/start', { method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': CLI_UA }, body: '{}' }).then((r) => r.json());
     if (!start?.device_code) die('发起网页授权失败，请重试或检查网络');
     console.log('请在浏览器用你的账号登录并点【确认授权】：');
     console.log('  ' + start.verify_url);
@@ -205,7 +209,7 @@ async function cmdLogin() {
     while (Date.now() < deadline) {
       await sleep((start.interval || 3) * 1000);
       process.stdout.write('.');
-      const p = await fetch(base + '/api/auth/cli/poll', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device_code: start.device_code }) }).then((r) => r.json()).catch(() => ({}));
+      const p = await fetch(base + '/api/auth/cli/poll', { method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': CLI_UA }, body: JSON.stringify({ device_code: start.device_code }) }).then((r) => r.json()).catch(() => ({}));
       if (p.status === 'approved') { process.stdout.write('\n'); await afterLogin(loadConfig(), p.token, p.user?.display_name); return; }
       if (p.status === 'expired') { process.stdout.write('\n'); die('授权码已过期，请重新运行 chenyu-pro login --web'); }
     }
@@ -564,7 +568,7 @@ async function pointsBalanceSafe() {
   try {
     const cfg = loadConfig();
     if (!cfg.credit_key) return null;
-    const res = await fetch((cfg.credit_base || DEFAULT_CREDIT_BASE) + '/api/jimeng/v1/key', { headers: { Authorization: 'Bearer ' + cfg.credit_key } });
+    const res = await fetch((cfg.credit_base || DEFAULT_CREDIT_BASE) + '/api/jimeng/v1/key', { headers: { Authorization: 'Bearer ' + cfg.credit_key, 'User-Agent': CLI_UA } });
     const n = Number((await res.json().catch(() => ({})))?.key?.pointsBalance);
     return Number.isFinite(n) ? n : null;
   } catch { return null; }
