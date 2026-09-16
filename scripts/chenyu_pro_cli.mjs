@@ -9,6 +9,8 @@ import os from 'node:os';
 import { exec, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.4.0 2026-09-17  写作方式默认 1:1 还原：video-analyze 建的项目带 write_mode=faithful 预设（平台「开始生成」
+//                    按原片整理，不再走原创流程改写台词）；SKILL 明确没提洗稿就 1:1（名字/剧情/台词/集数不改）。
 // v2.3.8 2026-09-16  video-analyze 取回平台新产物 video_reverse_全剧合集.md（剧集索引+人物/场景/道具
 //                    资产表+事件表+逐集分析表），SKILL 补「合集→建映射表→逐集改写→过门回传」洗稿三步。
 // v2.3.7 2026-09-16  所有请求带 User-Agent `chenyu-pro-cli/<版本> node/<版本>`，平台日志可识别
@@ -82,7 +84,7 @@ import { exec, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.3.8';
+const VERSION = '2.4.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -610,7 +612,8 @@ async function cmdVideoAnalyze() {
     config: {
       genre: '短剧', audience: '待确认', production_format: '真人剧',
       source_type: 'video_reverse_series', model_strategy: 'balanced',
-      config_json: { created_from: 'chenyu-pro-cli-agent', authoring: 'agent' }
+      // write_mode=faithful：原片项目默认 1:1 还原；网页「开始生成」也按这个预设走，不会改写台词/改剧情。
+      config_json: { created_from: 'chenyu-pro-cli-agent', authoring: 'agent', write_mode: 'faithful' }
     }
   } });
   const pid = created.project?.id || created.id;
