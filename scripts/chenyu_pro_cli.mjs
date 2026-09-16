@@ -9,6 +9,8 @@ import os from 'node:os';
 import { exec, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.3.8 2026-09-16  video-analyze 取回平台新产物 video_reverse_全剧合集.md（剧集索引+人物/场景/道具
+//                    资产表+事件表+逐集分析表），SKILL 补「合集→建映射表→逐集改写→过门回传」洗稿三步。
 // v2.3.7 2026-09-16  所有请求带 User-Agent `chenyu-pro-cli/<版本> node/<版本>`，平台日志可识别
 //                    客户在跑哪一版 CLI（排查改包版/旧版用）。不改任何业务行为。
 // v2.3.6 2026-09-15  gate：补非△行整片时间轴/"按源视频"整片时长/"场景0XX"流水号检测(判 GATE_FAIL)。
@@ -80,7 +82,7 @@ import { exec, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.3.7';
+const VERSION = '2.3.8';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -674,7 +676,8 @@ async function cmdVideoAnalyze() {
   const outDir = path.resolve(arg('out', './chenyu-video-analysis'));
   fs.mkdirSync(outDir, { recursive: true });
   const arts = (await api(`/api/projects/${pid}/artifacts`)).artifacts || [];
-  const want = ['video_reverse_source.md', 'video_reverse_replay_script.md', 'episode_index.json', 'identity_registry.json'];
+  // 全剧合集是洗稿主用文件（剧集索引+人物/场景/道具资产表+事件表+逐集分析表），其余为备查。
+  const want = ['video_reverse_全剧合集.md', 'video_reverse_source.md', 'video_reverse_replay_script.md', 'episode_index.json', 'identity_registry.json'];
   let got = 0;
   for (const a of arts) {
     const fn = String(a.filename || a.title || '');
@@ -712,7 +715,8 @@ async function cmdVideoAnalyze() {
   console.log(`✓ 分析稿已取回 ${got} 个文件 -> ${outDir}`);
   if (partial) console.log(`⚠ 部分段未完成：${partial}\n  已完成的段已取回；不要整批重新提交（会对已成功的段重复扣分），把缺的集告诉用户。`);
   if (identityOnly) console.log('ℹ 分析完整。平台标记"人物身份待核"（单包分析常见，不是缺内容）——写作时按分析稿人物表统一称呼即可，无需重交。');
-  console.log('  下一步（零积分）：你(Agent)读 video_reverse_source.md，按 SKILL 写作规范自己写剧本，');
+  console.log('  下一步（零积分）：你(Agent)读 video_reverse_全剧合集.md —— 里面有剧集索引、人物/场景/道具资产表、');
+  console.log('  事件表和逐集分析表。先按资产表做新旧映射，再照逐集分析表逐集改写；');
   console.log(`  过 gate 后 chenyu-pro save --project ${pid.slice(-8)} --episode N --file 第00N集.txt`);
 }
 
