@@ -9,6 +9,8 @@ import os from 'node:os';
 import { exec, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.5.0 2026-09-19  新增 video-fetch：零积分重新取回项目最新分析稿（平台修复/补充后直接取，不用重新分析）；
+//                    分段质量检查只看每段最新版本（平台修复后旧版不再误报 ⛔）；SKILL 加辰屿版权与来源声明规则。
 // v2.4.1 2026-09-17  同一部剧一个项目：video-analyze 支持 --project 追加到已有项目（平台把新集和已有集合并做人物审计），
 //                    集号按文件名（第34集/EP34/34.mp4）而不是提交顺序；文件名不是从第 1 集开始又没给 --project 时拦下，
 //                    防止 Agent 一集一个项目（2026-09-14 一个账号 43 个单集项目，跨集人物对不上）。取回分析稿只取最新版本。
@@ -87,7 +89,7 @@ import { exec, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.4.1';
+const VERSION = '2.5.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -601,6 +603,60 @@ async function fetchArtifactText(a) {
   return content;
 }
 
+// 取回项目最新分析稿到本地 + 逐段检查分析质量（每段只看最新版本）。零积分。
+async function downloadVideoAnalysis(pid, outDir) {
+  fs.mkdirSync(outDir, { recursive: true });
+  const arts = (await api(`/api/projects/${pid}/artifacts`)).artifacts || [];
+  // 全剧合集是洗稿主用文件（剧集索引+人物/场景/道具资产表+事件表+逐集分析表），其余为备查。
+  const want = ['video_reverse_全剧合集.md', 'video_reverse_source.md', 'video_reverse_replay_script.md', 'episode_index.json', 'identity_registry.json'];
+  let got = 0;
+  const written = new Set();
+  // 产物列表按更新时间倒序：同名文件只取第一个（最新版），平台修复或追加分析后旧版本不会覆盖新版本。
+  for (const a of arts) {
+    const fn = String(a.filename || a.title || '');
+    if (!want.includes(fn) || written.has(fn)) continue;
+    const content = await fetchArtifactText(a);
+    if (!content.trim()) continue;
+    fs.writeFileSync(path.join(outDir, fn), content, 'utf8');
+    written.add(fn);
+    got += 1;
+  }
+  // 逐段查分析质量（每段只看最新版本）：残缺稿必须拦在 Agent 写作之前。
+  const badSegments = [];
+  const checked = new Set();
+  for (const a of arts) {
+    const fn = String(a.filename || a.title || '');
+    if (!/^video_reverse_segment_.+\.json$/.test(fn) || checked.has(fn)) continue;
+    checked.add(fn);
+    try {
+      const seg = JSON.parse(await fetchArtifactText(a));
+      const rows = Array.isArray(seg.shot_rows) ? seg.shot_rows.length : 0;
+      const flags = Array.isArray(seg.quality_flags) ? seg.quality_flags : [];
+      if (!rows || flags.length) badSegments.push(`${seg.segment?.segment_id || fn}（镜头表${rows}行${flags.length ? '，' + String(flags[0]).slice(0, 40) : ''}）`);
+    } catch { /* 取不到单段文件不影响主流程 */ }
+  }
+  return { got, badSegments };
+}
+
+// 零积分：重新取回某个项目最新的分析稿（平台修复、追加分析后用这个取，不要重新提交视频）。
+async function cmdVideoFetch() {
+  const fragment = arg('project') || die('缺 --project <id片段或剧名>');
+  const target = await findProject(fragment);
+  if (target.mode && target.mode !== 'video_reverse') die(`项目《${target.title}》不是视频分析项目`);
+  const jobs = (await api(`/api/projects/${target.id}/jobs`)).jobs || [];
+  const running = jobs.find((j) => /video_reverse/.test(String(j.job_type || j.type || '')) && ['queued', 'running'].includes(String(j.status || '')));
+  if (running) die(`项目《${target.title}》的分析稿正在处理（${running.message || running.status}），完成后再取`);
+  const outDir = path.resolve(arg('out', './chenyu-video-analysis'));
+  const { got, badSegments } = await downloadVideoAnalysis(target.id, outDir);
+  if (!got) die(`项目《${target.title}》还没有分析稿`);
+  console.log(`✓ 已取回《${target.title}》最新分析稿 ${got} 个文件 -> ${outDir}（零积分）`);
+  if (badSegments.length) {
+    console.log(`⛔ 以下段分析稿仍不完整：\n  ${badSegments.join('\n  ')}\n  这几集先不要写，原样告诉用户，由平台核实处理；不要重新提交整批视频（会重复扣分）。`);
+  } else {
+    console.log('✓ 各段分析稿完整，可以开始写作（先读 video_reverse_全剧合集.md）。');
+  }
+}
+
 async function cmdVideoAnalyze() {
   const files = arg('video-file', '').split(',').map((s) => s.trim()).filter(Boolean).map((s) => path.resolve(s));
   const urls = arg('video-url', '').split(',').map((s) => s.trim()).filter((s) => /^https?:\/\//i.test(s));
@@ -740,39 +796,7 @@ async function cmdVideoAnalyze() {
 
   // ⑥ 取回分析稿交给 Agent
   const outDir = path.resolve(arg('out', './chenyu-video-analysis'));
-  fs.mkdirSync(outDir, { recursive: true });
-  const arts = (await api(`/api/projects/${pid}/artifacts`)).artifacts || [];
-  // 全剧合集是洗稿主用文件（剧集索引+人物/场景/道具资产表+事件表+逐集分析表），其余为备查。
-  const want = ['video_reverse_全剧合集.md', 'video_reverse_source.md', 'video_reverse_replay_script.md', 'episode_index.json', 'identity_registry.json'];
-  let got = 0;
-  const written = new Set();
-  // 产物列表按更新时间倒序：同名文件只取第一个（最新版），追加分析后旧版本不会覆盖新版本。
-  for (const a of arts) {
-    const fn = String(a.filename || a.title || '');
-    if (!want.includes(fn) || written.has(fn)) continue;
-    let content = String(a.content || '');
-    if (!content) {
-      try { content = String((await api(`/api/artifacts/${a.id}/content`)).content || ''); } catch { /* 跳过取不到的 */ }
-    }
-    if (!content.trim()) continue;
-    fs.writeFileSync(path.join(outDir, fn), content, 'utf8');
-    written.add(fn);
-    got += 1;
-  }
-  // 逐段查分析质量：平台对格式有问题的段只标记不重跑（避免重复扣分），残缺稿必须拦在 Agent 写作之前。
-  const badSegments = [];
-  for (const a of arts) {
-    const fn = String(a.filename || a.title || '');
-    if (!/^video_reverse_segment_.+\.json$/.test(fn)) continue;
-    try {
-      let content = String(a.content || '');
-      if (!content) content = String((await api(`/api/artifacts/${a.id}/content`)).content || '');
-      const seg = JSON.parse(content);
-      const rows = Array.isArray(seg.shot_rows) ? seg.shot_rows.length : 0;
-      const flags = Array.isArray(seg.quality_flags) ? seg.quality_flags : [];
-      if (!rows || flags.length) badSegments.push(`${seg.segment?.segment_id || fn}（镜头表${rows}行${flags.length ? '，' + String(flags[0]).slice(0, 40) : ''}）`);
-    } catch { /* 取不到单段文件不影响主流程 */ }
-  }
+  const { got, badSegments } = await downloadVideoAnalysis(pid, outDir);
   await reportCharge();
   if (badSegments.length) {
     console.log(`⛔ 以下段分析稿不完整（缺画面动作/镜头表）：\n  ${badSegments.join('\n  ')}\n  不要据此写作、不要用占位话凑 △——先原样告诉用户，由平台核实后重跑或退分。`);
@@ -815,6 +839,7 @@ function cmdHelp() {
   chenyu-pro video-analyze --video-file a.mp4,b.mp4 [--yes]  视频→分析稿(只分析不代写)
   chenyu-pro video-analyze --video-url <链接> [--out <目录>]  计费: ${POINTS_PER_SEGMENT} 分 / ${SEGMENT_SECONDS} 秒段(不足一段按一段)
   chenyu-pro video-analyze --project <id片段|剧名> --video-file 第4集.mp4  同一部剧追加到已有项目(人物跨集合并)
+  chenyu-pro video-fetch --project <id片段|剧名> [--out <目录>]  零积分重新取回最新分析稿(平台修复后用这个取)
     同一部剧只用一个项目：一次提交全部集，或后续用 --project 追加；不要一集一个项目、不要并发提交。
     集号按文件名(第N集/EPN/N.mp4)；文件名不是从第1集开始又没给 --project 会被拦下(新剧中途开始加 --new-series)。
     不加 --yes 只报价不执行；分析稿取回后由你(Agent)自己写剧本，写作零积分。
@@ -824,5 +849,5 @@ function cmdHelp() {
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, 'video-analyze': cmdVideoAnalyze, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 await (commands[cmd] || cmdHelp)();
