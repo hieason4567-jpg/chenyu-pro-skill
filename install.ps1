@@ -40,4 +40,4 @@ Write-Host ""
 Write-Host "Install complete. First use:" -ForegroundColor Green
 Write-Host "  chenyu-pro key set <credit-key>   (auto sign-in, no password needed)"
 Write-Host "  chenyu-pro credits"
-exit 0
+# 不要 exit：用 irm | iex 运行时 exit 会直接关掉用户的 PowerShell 窗口，看不到安装结果

@@ -9,6 +9,7 @@ import os from 'node:os';
 import { exec, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.5.1 2026-09-21  安装脚本去掉结尾 exit（irm | iex 时会关掉用户窗口，看不到安装结果）。
 // v2.5.0 2026-09-19  新增 video-fetch：零积分重新取回项目最新分析稿（平台修复/补充后直接取，不用重新分析）；
 //                    分段质量检查只看每段最新版本（平台修复后旧版不再误报 ⛔）；SKILL 加辰屿版权与来源声明规则。
 // v2.4.1 2026-09-17  同一部剧一个项目：video-analyze 支持 --project 追加到已有项目（平台把新集和已有集合并做人物审计），
@@ -89,7 +90,7 @@ import { exec, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.5.0';
+const VERSION = '2.5.1';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
