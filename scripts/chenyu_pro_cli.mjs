@@ -9,6 +9,8 @@ import os from 'node:os';
 import { exec, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.5.2 2026-09-21  视频上传：每个视频超时+重试（换新地址）、并发默认 2、已传的记本地清单，失败后加 --project 重跑只补没传的，
+//                    不再一个超时整批作废。
 // v2.5.1 2026-09-21  安装脚本去掉结尾 exit（irm | iex 时会关掉用户窗口，看不到安装结果）。
 // v2.5.0 2026-09-19  新增 video-fetch：零积分重新取回项目最新分析稿（平台修复/补充后直接取，不用重新分析）；
 //                    分段质量检查只看每段最新版本（平台修复后旧版不再误报 ⛔）；SKILL 加辰屿版权与来源声明规则。
@@ -90,7 +92,7 @@ import { exec, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.5.1';
+const VERSION = '2.5.2';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -737,26 +739,70 @@ async function cmdVideoAnalyze() {
     console.log(`✓ 追加到已有项目: ${pid.slice(-8)}  《${title}》（已分析 ${existingEpisodes.length} 集，本次和已有集一起做人物审计）`);
   }
 
-  // ③ 上传本地视频（有界并发 4）
+  // ③ 上传本地视频：每个视频单独超时+重试（每次换新上传地址），传成功的记到本地清单，
+  // 断网/超时后用同一条命令加 --project 重跑会跳过已传的，只补没传的。
+  // 2026-09-21：38 集里一个超时就整批退出、重跑又从头全传，移动线路到存储不稳时永远传不完。
+  const cacheDir = path.join(CONFIG_DIR, 'uploads');
+  const cachePath = path.join(cacheDir, `${pid}.json`);
+  let uploadCache = {};
+  try { uploadCache = JSON.parse(fs.readFileSync(cachePath, 'utf8')) || {}; } catch {}
+  const saveCache = () => {
+    try { fs.mkdirSync(cacheDir, { recursive: true }); fs.writeFileSync(cachePath, JSON.stringify(uploadCache, null, 1)); } catch {}
+  };
+  const concurrency = Math.max(1, Math.min(4, Number(arg('upload-concurrency', '2')) || 2));
+  const maxAttempts = Math.max(1, Number(arg('upload-retries', '4')) || 4);
   const uploaded = [];
+  const failed = [];
   let next = 0;
   const uploadOne = async (i) => {
     const fp = files[i];
     const name = path.basename(fp);
     const mime = guessVideoMime(name);
-    const size = fs.statSync(fp).size;
-    const signed = await api(`/api/projects/${pid}/client-media/signed-upload`, { method: 'POST', body: { kind: 'video', filename: name, mimeType: mime, size } });
-    const uploadUrl = signed.upload?.uploadUrl || signed.uploadUrl;
-    const mediaPath = signed.upload?.path || signed.path;
-    if (!uploadUrl || !mediaPath) die('获取视频上传地址失败: ' + name);
-    const put = await fetch(uploadUrl, { method: 'PUT', body: fs.readFileSync(fp), headers: { 'Content-Type': mime } });
-    if (!put.ok) die(`视频上传失败（HTTP ${put.status}）: ${name}`);
-    uploaded[i] = { client_media_path: mediaPath, title: name, mime_type: mime, size_bytes: size };
-    console.log(`  ✓ 已上传 ${name} (${(size / 1048576).toFixed(1)}MB)`);
+    const stat = fs.statSync(fp);
+    const size = stat.size;
+    const cacheKey = `${path.resolve(fp)}|${size}|${Math.round(stat.mtimeMs)}`;
+    if (uploadCache[cacheKey]?.client_media_path) {
+      uploaded[i] = uploadCache[cacheKey];
+      console.log(`  ✓ 已传过，跳过 ${name}`);
+      return;
+    }
+    const body = fs.readFileSync(fp);
+    // 超时按体积放宽：至少 3 分钟，按 50KB/s 最慢速度估算
+    const timeoutMs = Math.max(180000, Math.ceil(size / 50000) * 1000);
+    let lastError = '';
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const signed = await api(`/api/projects/${pid}/client-media/signed-upload`, { method: 'POST', body: { kind: 'video', filename: name, mimeType: mime, size } });
+        const uploadUrl = signed.upload?.uploadUrl || signed.uploadUrl;
+        const mediaPath = signed.upload?.path || signed.path;
+        if (!uploadUrl || !mediaPath) throw new Error('获取视频上传地址失败');
+        const put = await fetch(uploadUrl, { method: 'PUT', body, headers: { 'Content-Type': mime }, signal: AbortSignal.timeout(timeoutMs) });
+        if (!put.ok) throw new Error(`HTTP ${put.status}`);
+        uploaded[i] = { client_media_path: mediaPath, title: name, mime_type: mime, size_bytes: size };
+        uploadCache[cacheKey] = uploaded[i];
+        saveCache();
+        console.log(`  ✓ 已上传 ${name} (${(size / 1048576).toFixed(1)}MB)${attempt > 1 ? `，第 ${attempt} 次成功` : ''}`);
+        return;
+      } catch (error) {
+        const cause = error?.cause?.code || error?.cause?.message || '';
+        lastError = `${error?.name === 'TimeoutError' ? '超时' : error?.message || error}${cause ? ` (${cause})` : ''}`;
+        if (attempt < maxAttempts) {
+          console.log(`  … ${name} 第 ${attempt} 次上传失败：${lastError}，${attempt * 10} 秒后重试`);
+          await sleep(attempt * 10000);
+        }
+      }
+    }
+    failed.push({ name, error: lastError });
   };
-  await Promise.all(Array.from({ length: Math.min(4, files.length || 1) }, async () => {
+  await Promise.all(Array.from({ length: Math.min(concurrency, files.length || 1) }, async () => {
     for (let i = next++; i < files.length; i = next++) await uploadOne(i);
   }));
+  if (failed.length) {
+    for (const item of failed) console.log(`  ✗ ${item.name}：${item.error}`);
+    die(`${failed.length} 个视频没传上去（网络到存储不稳定），本次没有提交分析、没有扣分。\n` +
+      `  已传成功的 ${uploaded.filter(Boolean).length} 个已记录，重跑时会跳过。请用同一条命令加 --project ${pid.slice(-8)} 重跑，\n` +
+      `  只会补传没传上的；网络持续超时可换网络（如手机热点）或加 --upload-concurrency 1。`);
+  }
 
   // ④ 只分析：不传 auto_start_workflow，平台不会接着代写
   // 集号：文件名能取到就用文件名；否则接在项目已有集之后按顺序编。
