@@ -6,9 +6,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { exec, spawnSync } from 'node:child_process';
+import { exec, spawn, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.6.0 2026-09-24  制片级剧本格式：场次头 N-1 日/夜 内/外 地点 + 人物行 + 环境描述行 + 台词情绪括注 + （画面：）块 + △镜头过渡；
+//                    gate 放行人物行/画面块/环境描述行（不误判小说），台词情绪括注两种位置均兼容。
+// v2.6.0 2026-09-22  上传前自动压缩恢复：有 ffmpeg 时先压到 720p 再传（省带宽降超时，计费按时长不变，--no-compress 关/--proxy-height 调）；
+//                    v2.1.0 重构曾误删该逻辑（客户端一直传原片致大文件超时）。同版角色形象变体：剧本每场【形象】角色=变体名（变化注明原因）；gate 逐场/跨集核对（缺标、无因变化、
+//                    场内无换装动作、泛称变体名、与形象变体表不一致）；新增 variants 命令自动汇总每人几个变体、出现在哪几集哪几场。
 // v2.5.2 2026-09-21  视频上传：每个视频超时+重试（换新地址）、并发默认 2、已传的记本地清单，失败后加 --project 重跑只补没传的，
 //                    不再一个超时整批作废。
 // v2.5.1 2026-09-21  安装脚本去掉结尾 exit（irm | iex 时会关掉用户窗口，看不到安装结果）。
@@ -92,7 +97,7 @@ import { exec, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.5.2';
+const VERSION = '2.6.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -349,14 +354,128 @@ const isSceneHead = (l) => /^\d+-\d+\s+\S/.test(l);
 const isEpTitle = (l) => /^第\d+集/.test(l);
 const isActionLine = (l) => l.startsWith('△') || l.startsWith('▲');
 const isMetaLine = (l) => /^【(画面|运镜|音效|字幕|转场|特效)】/.test(l);
+// 场次人物行：`人物：苏燃、周母`。列出本场出场人物，不是台词。
+const isCharacterListLine = (l) => /^人物\s*[:：]/.test(l);
+// 画面/镜头描述块：`（画面：…）`、`（镜头：…）`、`（环境：…）`、`（转场：…）`。整行括号，给下游/读者的画面提示，不是台词。
+const isPictureLine = (l) => /^[（(]\s*(画面|镜头|环境|转场|字幕|旁白)\s*[:：]/.test(l);
 const matchDialogue = (l) => {
-  if (isActionLine(l) || isMetaLine(l) || isSceneHead(l) || isEpTitle(l)) return null;
+  if (isActionLine(l) || isMetaLine(l) || isSceneHead(l) || isEpTitle(l) || isCharacterListLine(l) || isPictureLine(l)) return null;
   const m = l.match(/^([^\s：:△▲【\d][^：:]{0,9})(（[^）]*）|\([^)]*\))?[：:](.+)$/);
-  return m ? { speaker: m[1].trim(), body: m[3].trim() } : null;
+  return m ? { speaker: m[1].trim(), note: (m[2] || '').trim(), body: m[3].trim() } : null;
 };
 
+// ---------- 形象变体（v2.6.0）----------
+// 每场开头一行「【形象】角色=变体名；角色=变体名」，场内换装在换装△后再写一行；形象跟上一场不同时括号注明原因：
+//   【形象】苏燃=外出便装（回房换上外套）
+// 变体名必须具体（下游客户端建卡用 [角色-变体名] 标签，拒收"主形象/日常/默认"这类泛称）。
+// 规则来自出片事故：瞬时状态（淋湿/衣服被扯乱）不是变体；围裙/首饰/眼镜这类叠加小件记道具不建变体；
+// 同一场同一人只有一个形象，除非有可见的换装△。
+const isVariantLine = (l) => /^【形象】/.test(l);
+const VARIANT_PLACEHOLDER_RE = /^(?:基础形象|基本形象|默认形象|主形象|默认|主状态|基础|日常|日常装|日常服|常服|常态|常规|初始|初始形象|原样|同上|不变|default|base|basic)$/iu;
+const VOICE_ONLY_NOTE_RE = /画外音|电话|OS|旁白|VO|广播|心声|内心/i;
+// 场内换形象要有可见的换装/受伤类动作，且△里写到这个人
+const VARIANT_CHANGE_ACTION_RE = /换|穿|脱|披|套上|系上|解开|解下|扯下|摘下|戴上|包扎|缠上|剪|剃|染|卸妆|化妆|淋湿|溅|受伤|流血|撕破|撕开|更衣|裹上/;
+function parseVariantLine(l) {
+  const entries = [], problems = [];
+  const body = l.replace(/^【形象】\s*/, '').trim();
+  if (!body) { problems.push('【形象】后面是空的'); return { entries, problems }; }
+  // 多人之间用 ；分隔，也容忍 ，、——只在后面紧跟「名字=」时才当分隔符，原因括号里的逗号不受影响
+  for (const raw of body.split(/[；;，,、](?=[^=＝:：（(；;，,、）)]{1,12}[=＝:：])/).map((x) => x.trim()).filter(Boolean)) {
+    const m = raw.match(/^([^=＝:：（(]+?)\s*[=＝:：]\s*([^（(]+?)\s*(?:[（(]([^）)]*)[）)])?$/);
+    if (!m) { problems.push(`「${raw}」写法不对，应为「角色=变体名」或「角色=变体名（变化原因）」，多人用；分隔`); continue; }
+    const [, name, variant, cause] = m.map((x) => (x || '').trim());
+    if (VARIANT_PLACEHOLDER_RE.test(variant)) problems.push(`「${name}=${variant}」变体名太笼统——写具体外观（如 居家睡衣/黑色厨师服/额头包扎），下游建卡拒收"主形象/日常/默认"`);
+    else if (/[-－—\[\]【】]/.test(variant)) problems.push(`「${name}=${variant}」变体名里不要有 - 或括号（下游标签是 [角色-变体名]）`);
+    else if (variant.length > 10) problems.push(`「${name}=${variant}」变体名超过10字——变体名要短，外观细节写进形象变体表`);
+    entries.push({ name, variant, cause });
+  }
+  const seen = new Map();
+  for (const e of entries) {
+    if (seen.has(e.name) && seen.get(e.name) !== e.variant) problems.push(`同一行里「${e.name}」写了两个形象（${seen.get(e.name)} / ${e.variant}）——同一时刻一人只有一个形象`);
+    seen.set(e.name, e.variant);
+  }
+  return { entries, problems };
+}
+// 形象变体表（Agent 交付的资产表之一）：markdown 表格，第一列=角色。
+// 变体名列按表头「变体名」定位（合集/variants 命令的表是 角色|变体数|变体名|…，变体名在第3列；
+// 手写表可能是 角色|变体名|…，在第2列）。找不到表头就默认第2列，并跳过纯数字（变体数列）。
+function parseVariantTable(text) {
+  const table = new Map();
+  let variantCol = 1;
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const cells = line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((x) => x.trim());
+    if (cells.length < 2) continue;
+    if (/^角色/.test(cells[0])) {
+      const idx = cells.findIndex((c) => /变体名|形象名/.test(c) || c === '变体' || c === '形象');
+      if (idx > 0) variantCol = idx;
+      continue;
+    }
+    if (!cells[0] || /^[-:\s]+$/.test(cells[0])) continue;
+    const variant = cells[variantCol] || cells[1];
+    if (!variant || /^\d+$/.test(variant)) continue; // 跳过纯数字（变体数列）
+    if (!table.has(cells[0])) table.set(cells[0], new Set());
+    table.get(cells[0]).add(variant);
+  }
+  return table;
+}
+// 逐场检查形象标记；ctx 跨集延续（gate --dir 按集号顺序共用一个 ctx）。只在剧本用了【形象】时启用，旧剧本不受影响。
+function checkVariants(rawLines, ctx, errors, warnings) {
+  const used = rawLines.some((l) => isVariantLine(l.trim()));
+  if (!used && !ctx.required) return 0;
+  let scene = null;
+  let marks = 0;
+  const closeScene = () => {
+    if (!scene) return;
+    if (scene.speakers.size && !scene.hasMark) warnings.push(`场景「${scene.head}」（第${scene.line}行）没有【形象】行——出场人物要标当前形象`);
+    else {
+      const missing = [...scene.speakers].filter((n) => !scene.declared.has(n) && !ctx.aliases?.has(n));
+      if (missing.length) warnings.push(`场景「${scene.head}」（第${scene.line}行）${missing.join('、')} 说了话但【形象】里没标——补上当前形象`);
+    }
+  };
+  for (let i = 0; i < rawLines.length; i++) {
+    const l = rawLines[i].trim();
+    const ln = i + 1;
+    if (!l) continue;
+    if (isSceneHead(l)) {
+      closeScene();
+      scene = { head: l, line: ln, hasMark: false, declared: new Map(), speakers: new Set(), actionsSinceMark: [] };
+      continue;
+    }
+    if (!scene) scene = { head: '（第一场之前）', line: ln, hasMark: false, declared: new Map(), speakers: new Set(), actionsSinceMark: [] };
+    if (isActionLine(l)) { scene.actionsSinceMark.push(l); continue; }
+    if (isVariantLine(l)) {
+      marks++;
+      const { entries, problems } = parseVariantLine(l);
+      for (const pb of problems) errors.push(`第${ln}行 ${pb}`);
+      const midScene = scene.hasMark;
+      for (const e of entries) {
+        const before = scene.declared.get(e.name) || ctx.last.get(e.name)?.variant;
+        if (before && before !== e.variant) {
+          if (midScene && scene.declared.has(e.name) && !scene.actionsSinceMark.some((a) => a.includes(e.name) && VARIANT_CHANGE_ACTION_RE.test(a))) {
+            warnings.push(`第${ln}行 「${e.name}」同一场里从「${before}」变成「${e.variant}」，但前面没有换装的△——先写可见的换装动作`);
+          }
+          if (!e.cause) warnings.push(`第${ln}行 「${e.name}」形象从「${before}」变成「${e.variant}」没注明原因——写成「${e.name}=${e.variant}（换装/受伤/时间跳跃等原因）」；如果其实没变，沿用「${before}」`);
+        }
+        if (ctx.table && !(ctx.table.get(e.name)?.has(e.variant))) {
+          warnings.push(`第${ln}行 「${e.name}=${e.variant}」不在形象变体表里——变体名要和表里一字不差（防止同一形象多个叫法），或把新变体补进表`);
+        }
+        scene.declared.set(e.name, e.variant);
+        ctx.last.set(e.name, { variant: e.variant });
+        ctx.usage.push({ episode: ctx.episode, scene: scene.head.split(/\s+/)[0], name: e.name, variant: e.variant, cause: e.cause, changed: Boolean(before && before !== e.variant) });
+      }
+      scene.hasMark = true;
+      scene.actionsSinceMark = [];
+      continue;
+    }
+    const d = matchDialogue(l);
+    if (d && !VOICE_ONLY_NOTE_RE.test(`${d.speaker}${d.note}`)) scene.speakers.add(d.speaker.replace(/[（(][^）)]*[）)]/g, '').trim());
+  }
+  closeScene();
+  return marks;
+}
+
 // 校验一份正文，返回 { errors: [], warnings: [], stats: {} }。行号从 1 开始。
-function gateOneScript(text) {
+function gateOneScript(text, ctx = newVariantContext()) {
   const rawLines = String(text).split(/\r?\n/);
   const errors = [], warnings = [];
   let dlgCount = 0, actCount = 0, silentBurstStart = -1;
@@ -372,6 +491,7 @@ function gateOneScript(text) {
     run = [];
   };
   let narrativeCount = 0;   // 既非台词/△/元信息/场次头的叙述行（小说识别用）
+  let inSceneIntro = false;  // 是否处在"场次头之后、首个△/台词之前"（环境描述行允许区）
   const actionSeen = new Map(); // △正文 → 出现行号（重复△检测）
   for (let i = 0; i < rawLines.length; i++) {
     const l = rawLines[i].trim();
@@ -380,6 +500,7 @@ function gateOneScript(text) {
     if (!isActionLine(l) && GATE_TIMELEAK_RE.test(l)) errors.push(`第${ln}行 残留整片时间轴/源视频标记（${(l.match(GATE_TIMELEAK_RE) || [''])[0]}）→ 删掉"按源视频"整片时长/"场景0XX"流水号/绝对时间轴；场景写真实地名，要时长只留单SHOT（时长3秒）`);
     if (isActionLine(l)) {
       flushRun();
+      inSceneIntro = false;
       actCount++;
       const body = l.slice(1).trim();
       if (GATE_MENTAL_RE.test(body)) errors.push(`第${ln}行 △写了心理活动（${(body.match(GATE_MENTAL_RE) || [''])[0]}）→ △只写可见的外部动作与神态，把心理翻译成身体反应`);
@@ -392,15 +513,20 @@ function gateOneScript(text) {
       if (body.length > 60) warnings.push(`第${ln}行 △太长（${body.length}字）——一行一件事，拆开`);
       continue;
     }
-    if (isMetaLine(l) || isSceneHead(l) || isEpTitle(l)) { flushRun(); continue; }
+    // 人物行、画面/镜头描述块：合法结构行，放行不计叙述。
+    if (isCharacterListLine(l) || isPictureLine(l)) { flushRun(); continue; }
+    if (isMetaLine(l) || isVariantLine(l) || isSceneHead(l) || isEpTitle(l)) { flushRun(); if (isSceneHead(l)) inSceneIntro = true; continue; }
     const d = matchDialogue(l);
     if (d) {
       dlgCount++;
+      inSceneIntro = false;
       run.push({ line: ln, speaker: d.speaker });
       if (d.body.length > 40) warnings.push(`第${ln}行 台词超长（${d.body.length}字）——超过40字的台词转分镜会被硬拆，建议按句号拆成两句`);
       continue;
     }
     flushRun(); // 其他叙述行也算隔断
+    // 场次头之后、第一个△动作/台词之前的纯文字行 = 环境/画面描述，合法（不计叙述、不触发"这是小说"）。
+    if (inSceneIntro) continue;
     narrativeCount++;
   }
   flushRun();
@@ -426,11 +552,82 @@ function gateOneScript(text) {
   else if (dlgCount > 0 && dlgCount / Math.max(actCount, 1) > 2) warnings.push(`对白:动作 = ${dlgCount}:${actCount}（超过2:1）——目标约1:1，多补△（听者反应/说话人动作）`);
   const hasScene = rawLines.some(l => isSceneHead(l.trim()));
   if (!hasScene) warnings.push('没有场次头（如「1-1 面馆后厨 白天 室内」）——建议每场开头标场景/时间/内外');
-  return { errors, warnings, stats: { dialogue: dlgCount, action: actCount } };
+  const variantMarks = checkVariants(rawLines, ctx, errors, warnings);
+  return { errors, warnings, stats: { dialogue: dlgCount, action: actCount, variantMarks } };
+}
+
+function newVariantContext(table = null) {
+  return { last: new Map(), usage: [], table, episode: 0, required: false };
+}
+const episodeNoOfFile = (name) => Number((String(name).match(/第\s*0*(\d+)\s*集/) || String(name).match(/EP\s*0*(\d+)/i) || [])[1] || 0);
+// 目录里的剧本按集号排序（跨集形象延续要按顺序查）；形象变体表 / 汇总文件本身不当剧本查。
+function listScriptFiles(d) {
+  return fs.readdirSync(d)
+    .filter((name) => /\.(txt|md)$/i.test(name) && !/形象变体|资产表/.test(name))
+    .map((name) => path.join(d, name))
+    .sort((a, b) => (episodeNoOfFile(path.basename(a)) - episodeNoOfFile(path.basename(b))) || a.localeCompare(b));
+}
+function loadVariantTable(dir) {
+  const explicit = arg('variants', '');
+  const candidates = explicit ? [path.resolve(explicit)] : (dir ? fs.readdirSync(dir).filter((n) => /形象变体表/.test(n) && !/汇总/.test(n)).map((n) => path.join(dir, n)) : []);
+  for (const file of candidates) {
+    if (!fs.existsSync(file)) die('形象变体表不存在: ' + file);
+    const table = parseVariantTable(fs.readFileSync(file, 'utf8'));
+    if (table.size) return { table, file };
+  }
+  return { table: null, file: '' };
+}
+// 从正文【形象】标记汇总「每个角色几个变体、分别出现在哪几集哪几场、因何而变」。
+function summarizeVariantUsage(usage) {
+  const byRole = new Map();
+  for (const u of usage) {
+    if (!byRole.has(u.name)) byRole.set(u.name, new Map());
+    const variants = byRole.get(u.name);
+    if (!variants.has(u.variant)) variants.set(u.variant, { places: [], episodes: new Set(), causes: [] });
+    const v = variants.get(u.variant);
+    const place = u.episode ? `${u.episode}集${u.scene ? ' ' + u.scene : ''}` : u.scene;
+    if (!v.places.includes(place)) v.places.push(place);
+    if (u.episode) v.episodes.add(u.episode);
+    if (u.changed && u.cause && !v.causes.includes(u.cause)) v.causes.push(u.cause);
+  }
+  const lines = ['# 形象变体表（按正文【形象】标记自动汇总）', '', '| 角色 | 变体数 | 变体名 | 出现集 | 出现场次 | 变化原因 |', '| --- | --- | --- | --- | --- | --- |'];
+  for (const [name, variants] of byRole) {
+    for (const [variant, v] of variants) {
+      const eps = [...v.episodes].sort((a, b) => a - b);
+      const ranges = [];
+      for (const e of eps) {
+        const last = ranges[ranges.length - 1];
+        if (last && e === last[1] + 1) last[1] = e; else ranges.push([e, e]);
+      }
+      const epText = ranges.map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`)).join('、') || '-';
+      lines.push(`| ${name} | ${variants.size} | ${variant} | ${epText} | ${v.places.join('、')} | ${v.causes.join('；') || '-'} |`);
+    }
+  }
+  return { byRole, markdown: lines.join('\n') + '\n' };
 }
 
 // gate 命令：--file 单文件 / --dir 目录批量(.txt/.md)。跑门前仅做鉴权（不扣积分）。
 // 输出 GATE_PASS / GATE_FAIL(exit 1)。--no-auth 供离线自查（Agent 正式交付前仍须 auth）。
+// variants 命令：从正文【形象】标记汇总形象变体表（每个角色几个变体、出现在哪几集哪几场、因何而变），零积分、纯本地。
+async function cmdVariants() {
+  const dir = arg('dir', '') || die('用法: chenyu-pro variants --dir <剧本目录> [--out 形象变体汇总.md]');
+  const d = path.resolve(dir);
+  if (!fs.existsSync(d)) die('目录不存在: ' + d);
+  const files = listScriptFiles(d);
+  if (!files.length) die('目录里没有 .txt/.md 剧本文件');
+  const ctx = newVariantContext();
+  for (const f of files) {
+    ctx.episode = episodeNoOfFile(path.basename(f));
+    checkVariants(String(fs.readFileSync(f, 'utf8')).split(/\r?\n/), ctx, [], []);
+  }
+  if (!ctx.usage.length) die('正文里没有【形象】标记——先按写作规范每场标出场人物形象');
+  const { byRole, markdown } = summarizeVariantUsage(ctx.usage);
+  const out = path.resolve(arg('out', path.join(d, '形象变体汇总.md')));
+  fs.writeFileSync(out, markdown, 'utf8');
+  for (const [name, variants] of byRole) console.log(`  ${name}：${variants.size} 个形象（${[...variants.keys()].join(' / ')}）`);
+  console.log(`✓ 已汇总 ${byRole.size} 个角色的形象变体 -> ${out}`);
+}
+
 async function cmdGate() {
   if (!flag('no-auth')) await api('/api/auth/me');
   const file = arg('file', '');
@@ -440,15 +637,19 @@ async function cmdGate() {
   else if (dir) {
     const d = path.resolve(dir);
     if (!fs.existsSync(d)) die('目录不存在: ' + d);
-    for (const name of fs.readdirSync(d)) if (/\.(txt|md)$/i.test(name)) targets.push(path.join(d, name));
+    targets.push(...listScriptFiles(d));
     if (!targets.length) die('目录里没有 .txt/.md 剧本文件');
   } else die('用法: chenyu-pro gate --file 剧本.txt  或  chenyu-pro gate --dir <目录>');
+  const { table, file: tableFile } = loadVariantTable(dir ? path.resolve(dir) : '');
+  if (tableFile) console.log(`（按形象变体表核对变体名：${path.basename(tableFile)}）`);
+  const ctx = newVariantContext(table);
   let totalErr = 0, totalWarn = 0;
   for (const t of targets) {
     if (!fs.existsSync(t)) die('文件不存在: ' + t);
-    const { errors, warnings, stats } = gateOneScript(fs.readFileSync(t, 'utf8'));
+    ctx.episode = episodeNoOfFile(path.basename(t));
+    const { errors, warnings, stats } = gateOneScript(fs.readFileSync(t, 'utf8'), ctx);
     const name = path.basename(t);
-    console.log(`── ${name}  台词${stats.dialogue}句 / 动作${stats.action}行`);
+    console.log(`── ${name}  台词${stats.dialogue}句 / 动作${stats.action}行${stats.variantMarks ? ` / 形象标记${stats.variantMarks}行` : ''}`);
     for (const e of errors) console.log('  ✗ ' + e);
     for (const w of warnings) console.log('  ⚠ ' + w);
     if (!errors.length && !warnings.length) console.log('  ✓ 无问题');
@@ -560,6 +761,27 @@ async function cmdSave() {
 // 视频一律走本命令做平台反推（画面+声音）；禁止 Agent 用抽音频/转写/抽帧代替，
 // 只有台词没有画面动作，洗出的剧本乱、改动大（2026-09-13 用户实测反馈）。
 const VIDEO_MIME = { '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.mkv': 'video/x-matroska', '.webm': 'video/webm', '.avi': 'video/x-msvideo', '.m4v': 'video/x-m4v', '.ts': 'video/mp2t' };
+// 上传前压缩到低清分析代理：服务端视频反推只需看清人物/动作/服装，不需要原始高码率。
+// 有 ffmpeg 就先压到 proxyHeight（默认720p，保留音轨供台词/声音识别），上传体积小、超时概率低；
+// 没有 ffmpeg 或压缩失败就传原片。压缩不改视频时长，计费按秒数不变——这一步只省上传带宽，不省积分。
+function resolveFfmpeg() {
+  const cands = [process.env.CHENYU_FFMPEG, 'ffmpeg', 'C:\\ffmpeg\\bin\\ffmpeg.exe', 'C:\\ffmpeg-6.1.1\\bin\\ffmpeg.exe'].filter(Boolean);
+  for (const c of cands) {
+    try { const r = spawnSync(c, ['-version'], { windowsHide: true }); if (r.status === 0) return c; } catch { /* 下一个候选 */ }
+  }
+  return null;
+}
+function compressVideoProxy(ffmpeg, src, dst, height) {
+  return new Promise((resolve, reject) => {
+    try { fs.rmSync(dst, { force: true }); } catch { /* ignore */ }
+    const a = ['-y', '-i', src, '-vf', `scale=-2:${height}`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', dst];
+    const child = spawn(ffmpeg, a, { windowsHide: true });
+    let err = '';
+    child.stderr?.on('data', (d) => { err += d.toString(); if (err.length > 4000) err = err.slice(-4000); });
+    child.on('error', reject);
+    child.on('close', (code) => { (code === 0 && fs.existsSync(dst)) ? resolve() : reject(new Error(`ffmpeg 压缩失败(${code})`)); });
+  });
+}
 const guessVideoMime = (n) => VIDEO_MIME[path.extname(n).toLowerCase()] || 'video/mp4';
 const SEGMENT_SECONDS = 240;    // 平台按 240 秒切段（不足一段按一段算）
 const POINTS_PER_SEGMENT = 30;  // 每段 30 积分
@@ -611,7 +833,7 @@ async function downloadVideoAnalysis(pid, outDir) {
   fs.mkdirSync(outDir, { recursive: true });
   const arts = (await api(`/api/projects/${pid}/artifacts`)).artifacts || [];
   // 全剧合集是洗稿主用文件（剧集索引+人物/场景/道具资产表+事件表+逐集分析表），其余为备查。
-  const want = ['video_reverse_全剧合集.md', 'video_reverse_source.md', 'video_reverse_replay_script.md', 'episode_index.json', 'identity_registry.json'];
+  const want = ['video_reverse_全剧合集.md', 'video_reverse_source.md', 'video_reverse_replay_script.md', 'episode_index.json', 'identity_registry.json', 'character_variants.json'];
   let got = 0;
   const written = new Set();
   // 产物列表按更新时间倒序：同名文件只取第一个（最新版），平台修复或追加分析后旧版本不会覆盖新版本。
@@ -749,6 +971,11 @@ async function cmdVideoAnalyze() {
   const saveCache = () => {
     try { fs.mkdirSync(cacheDir, { recursive: true }); fs.writeFileSync(cachePath, JSON.stringify(uploadCache, null, 1)); } catch {}
   };
+  const proxyHeight = Math.max(240, Number(arg('proxy-height', '720')) || 720);
+  const ffmpeg = flag('no-compress') ? null : resolveFfmpeg();
+  const proxyDir = path.join(CONFIG_DIR, 'proxy');
+  if (ffmpeg) console.log(`  上传前压缩到 ${proxyHeight}p（省带宽、降超时；计费按时长不变；--no-compress 关）`);
+  else if (files.length && !flag('no-compress')) console.log('  提示: 未找到 ffmpeg → 传原始视频。装 ffmpeg（或设 CHENYU_FFMPEG）后会自动压缩再传，弱网更稳。');
   const concurrency = Math.max(1, Math.min(4, Number(arg('upload-concurrency', '2')) || 2));
   const maxAttempts = Math.max(1, Number(arg('upload-retries', '4')) || 4);
   const uploaded = [];
@@ -766,22 +993,41 @@ async function cmdVideoAnalyze() {
       console.log(`  ✓ 已传过，跳过 ${name}`);
       return;
     }
-    const body = fs.readFileSync(fp);
+    // 上传前压缩：有 ffmpeg 就压到代理分辨率；压完更大或失败都回退原片。压缩后的文件才是实际上传体。
+    let sendPath = fp;
+    let sendSize = size;
+    let proxyTmp = '';
+    if (ffmpeg) {
+      try {
+        fs.mkdirSync(proxyDir, { recursive: true });
+        const tmp = path.join(proxyDir, `p${i}_${proxyHeight}_${name.replace(/[^\w.\-]+/g, '_')}.mp4`);
+        await compressVideoProxy(ffmpeg, fp, tmp, proxyHeight);
+        const tsize = fs.statSync(tmp).size;
+        if (tsize > 0 && tsize < size) { sendPath = tmp; sendSize = tsize; proxyTmp = tmp; }
+        else { try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ } }
+      } catch (error) {
+        console.log(`  … ${name} 压缩失败(${String(error?.message || error).slice(0, 40)})，改传原片`);
+      }
+    }
+    const body = fs.readFileSync(sendPath);
     // 超时按体积放宽：至少 3 分钟，按 50KB/s 最慢速度估算
-    const timeoutMs = Math.max(180000, Math.ceil(size / 50000) * 1000);
+    const timeoutMs = Math.max(180000, Math.ceil(sendSize / 50000) * 1000);
+    const cleanupProxy = () => { if (proxyTmp) { try { fs.rmSync(proxyTmp, { force: true }); } catch { /* ignore */ } } };
     let lastError = '';
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
-        const signed = await api(`/api/projects/${pid}/client-media/signed-upload`, { method: 'POST', body: { kind: 'video', filename: name, mimeType: mime, size } });
+        const signed = await api(`/api/projects/${pid}/client-media/signed-upload`, { method: 'POST', body: { kind: 'video', filename: name, mimeType: mime, size: sendSize } });
         const uploadUrl = signed.upload?.uploadUrl || signed.uploadUrl;
         const mediaPath = signed.upload?.path || signed.path;
         if (!uploadUrl || !mediaPath) throw new Error('获取视频上传地址失败');
         const put = await fetch(uploadUrl, { method: 'PUT', body, headers: { 'Content-Type': mime }, signal: AbortSignal.timeout(timeoutMs) });
         if (!put.ok) throw new Error(`HTTP ${put.status}`);
-        uploaded[i] = { client_media_path: mediaPath, title: name, mime_type: mime, size_bytes: size };
+        uploaded[i] = { client_media_path: mediaPath, title: name, mime_type: mime, size_bytes: sendSize };
         uploadCache[cacheKey] = uploaded[i];
         saveCache();
-        console.log(`  ✓ 已上传 ${name} (${(size / 1048576).toFixed(1)}MB)${attempt > 1 ? `，第 ${attempt} 次成功` : ''}`);
+        cleanupProxy();
+        const label = proxyTmp ? `${(sendSize / 1048576).toFixed(1)}MB，压自 ${(size / 1048576).toFixed(1)}MB` : `${(sendSize / 1048576).toFixed(1)}MB`;
+        console.log(`  ✓ 已上传 ${name} (${label})${attempt > 1 ? `，第 ${attempt} 次成功` : ''}`);
         return;
       } catch (error) {
         const cause = error?.cause?.code || error?.cause?.message || '';
@@ -792,6 +1038,7 @@ async function cmdVideoAnalyze() {
         }
       }
     }
+    cleanupProxy();
     failed.push({ name, error: lastError });
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, files.length || 1) }, async () => {
@@ -877,7 +1124,8 @@ function cmdHelp() {
   chenyu-pro create --title <剧名> --episodes 30 [--market us_en]   建项目壳(零积分，不触发平台生成)
   chenyu-pro save --project <id片段> --episode 1 --file 第001集.txt  回传 Agent 写好的一集正文
   chenyu-pro save --project <id片段> --dir <目录>          批量回传(文件名含 第N集 的 .txt/.md)
-  chenyu-pro gate --file 剧本.txt | --dir <目录>           格式门：确定性质量校验(对白连发/心理活动/超长台词)，改到 GATE_PASS
+  chenyu-pro gate --file 剧本.txt | --dir <目录>           格式门：确定性质量校验(对白连发/心理活动/超长台词/形象标记)，改到 GATE_PASS
+  chenyu-pro variants --dir <目录> [--out 文件]           从正文【形象】标记汇总形象变体表（每人几个变体、出现在哪几集哪几场）
   chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
   chenyu-pro fetch --project <id片段> --out <目录>          导出交付正文到本地
   chenyu-pro sync --project <id片段|剧名>                   同步到云端脚本库（辰屿客户端可下载）
@@ -896,5 +1144,5 @@ function cmdHelp() {
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 await (commands[cmd] || cmdHelp)();
