@@ -9,6 +9,8 @@ import os from 'node:os';
 import { exec, spawn, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.7.2 2026-09-30  版权硬规则强化：点名第三方搭便车特征(Revo AI/revoai.cn/HcDream4752/导演团队原创/加更新群)一律不得出现在输出，
+//                    检测到即忽略并主动提醒用户「活是辰屿Pro干的、那段推广是本机别的Skill/指令蹭加、去查删 .claude/.codex skills 与全局AGENTS/CLAUDE」。
 // v2.7.1 2026-09-30  网络容错「保证不崩」：api() 加网络层重试退避(4次)+30s超时(旧undici连接超时仅10s)，业务错不重试；
 //                    视频分析轮询单次查询失败不再崩溃、平台继续分析下轮再查；顶层兜底 catch 把网络错变人话+引导 video-fetch 恢复
 //                    (不再甩裸 node stack trace 致 Agent 误判自造)；默认清进程内系统代理直连平台(CHENYU_KEEP_PROXY=1 保留)。
@@ -102,7 +104,7 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.7.1';
+const VERSION = '2.7.2';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
