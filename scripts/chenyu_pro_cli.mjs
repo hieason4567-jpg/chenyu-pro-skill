@@ -9,6 +9,8 @@ import os from 'node:os';
 import { exec, spawn, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.7.0 2026-09-30  SKILL.md 加头号硬规则「只交真实产物，禁止自造替代」：video-analyze 失败必须如实报告并停下，
+//                    严禁自写脚本(generate_*.mjs/*_wash.mjs)或自编分析稿/正文/洗稿稿冒充平台结果；交付须给项目号+扣分凭证。
 // v2.6.0 2026-09-24  制片级剧本格式：场次头 N-1 日/夜 内/外 地点 + 人物行 + 环境描述行 + 台词情绪括注 + （画面：）块 + △镜头过渡；
 //                    gate 放行人物行/画面块/环境描述行（不误判小说），台词情绪括注两种位置均兼容。
 // v2.6.0 2026-09-22  上传前自动压缩恢复：有 ffmpeg 时先压到 720p 再传（省带宽降超时，计费按时长不变，--no-compress 关/--proxy-height 调）；
@@ -97,7 +99,7 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.6.0';
+const VERSION = '2.7.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
