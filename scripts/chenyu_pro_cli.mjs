@@ -9,6 +9,9 @@ import os from 'node:os';
 import { exec, spawn, spawnSync } from 'node:child_process';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.7.1 2026-09-30  网络容错「保证不崩」：api() 加网络层重试退避(4次)+30s超时(旧undici连接超时仅10s)，业务错不重试；
+//                    视频分析轮询单次查询失败不再崩溃、平台继续分析下轮再查；顶层兜底 catch 把网络错变人话+引导 video-fetch 恢复
+//                    (不再甩裸 node stack trace 致 Agent 误判自造)；默认清进程内系统代理直连平台(CHENYU_KEEP_PROXY=1 保留)。
 // v2.7.0 2026-09-30  SKILL.md 加头号硬规则「只交真实产物，禁止自造替代」：video-analyze 失败必须如实报告并停下，
 //                    严禁自写脚本(generate_*.mjs/*_wash.mjs)或自编分析稿/正文/洗稿稿冒充平台结果；交付须给项目号+扣分凭证。
 // v2.6.0 2026-09-24  制片级剧本格式：场次头 N-1 日/夜 内/外 地点 + 人物行 + 环境描述行 + 台词情绪括注 + （画面：）块 + △镜头过渡；
@@ -99,13 +102,18 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.7.0';
+const VERSION = '2.7.1';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
 const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 const DEFAULT_PLATFORM = 'https://chenyu.pumpumai.com';
+// 平台域名直连更稳：CLI 只连自己的 *.pumpumai.com(国内)。默认清掉本进程继承的系统代理(如 Clash 7890)，
+// 避免长轮询(视频分析十几分钟)时代理抖动/空闲断流致连接超时。确需经代理才能到平台的网络设 CHENYU_KEEP_PROXY=1 保留。
+if (!process.env.CHENYU_KEEP_PROXY) {
+  for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']) delete process.env[k];
+}
 const DEFAULT_CREDIT_BASE = 'https://drama.pumpumai.com';
 
 const MARKETS = {
@@ -157,7 +165,7 @@ async function ssoLoginWithKey() {
   } catch { return false; }
 }
 
-async function api(pathName, { method = 'GET', body, auth = true, base, _retried = false } = {}) {
+async function api(pathName, { method = 'GET', body, auth = true, base, _retried = false, retries = 4, timeoutMs = 30000 } = {}) {
   let cfg = loadConfig();
   const url = (base || cfg.platform_base || DEFAULT_PLATFORM) + pathName;
   const headers = { 'Content-Type': 'application/json', 'User-Agent': CLI_UA };
@@ -169,12 +177,30 @@ async function api(pathName, { method = 'GET', body, auth = true, base, _retried
     }
     headers.Authorization = 'Bearer ' + cfg.session_token;
   }
-  const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  // 网络层容错：连接超时/断连/DNS 抖动(如 Clash 代理波动)自动重试退避，绝不因单次网络波动崩掉整个任务；
+  // 单次请求 30s 超时(旧 undici 默认连接超时仅 10s 偏短)。业务错误(HTTP 4xx/5xx)不在此重试，仍走下方 die。
+  let res;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(timeoutMs) });
+      break;
+    } catch (err) {
+      const code = err?.cause?.code || err?.name || err?.message || 'network';
+      const isNet = err?.name === 'TimeoutError' || err?.name === 'AbortError'
+        || /UND_ERR|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|fetch failed|network|socket/i.test(`${code} ${err?.message || ''}`);
+      if (!isNet || attempt >= retries) {
+        const e = new Error(`网络请求失败: ${code}`); e.netFailed = true; e.detail = String(code); throw e;
+      }
+      const wait = Math.min(2000 * 2 ** attempt, 15000);
+      console.error(`  … 网络波动(${code})，${Math.round(wait / 1000)}s 后重试 ${attempt + 1}/${retries}`);
+      await sleep(wait);
+    }
+  }
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && auth) {
     // session 过期：用 KEY 自动续登一次再重试，仍不行才要求人工登录
     if (!_retried && await ssoLoginWithKey()) {
-      return api(pathName, { method, body, auth, base, _retried: true });
+      return api(pathName, { method, body, auth, base, _retried: true, retries, timeoutMs });
     }
     die('登录已失效——绑定了 KEY 会自动续登（刚已尝试失败），请检查 KEY 或重新 chenyu-pro login');
   }
@@ -1068,9 +1094,18 @@ async function cmdVideoAnalyze() {
   let lastMsg = '';
   let partial = '';
   let identityOnly = false;
+  let netFailStreak = 0;
   while (Date.now() < deadline) {
     await sleep(15000);
-    const jobs = (await api(`/api/projects/${pid}/jobs`)).jobs || [];
+    let jobs;
+    try {
+      jobs = (await api(`/api/projects/${pid}/jobs`)).jobs || [];
+      netFailStreak = 0;
+    } catch (e) {
+      // 进度查询网络暂时不通：平台仍在后台分析，绝不崩掉整个任务，下一轮继续查。
+      if (e?.netFailed) { netFailStreak++; console.log(`  … 进度查询网络暂不通(${e.detail})，平台仍在后台分析，${netFailStreak} 次，继续等待…`); continue; }
+      throw e;
+    }
     const job = jobs.find((j) => String(j.type || j.job_type || '').includes('video_reverse')) || jobs[0];
     if (!job) continue;
     const st = String(job.status || '');
@@ -1147,4 +1182,17 @@ function cmdHelp() {
 }
 
 const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
-await (commands[cmd] || cmdHelp)();
+try {
+  await (commands[cmd] || cmdHelp)();
+} catch (err) {
+  // 顶层兜底：网络彻底不通时给出人话 + 恢复路径，绝不甩裸 node stack trace(会让 Agent 误判彻底失败而自造结果)。
+  if (err?.netFailed) {
+    console.error(`✗ 网络连接失败(${err.detail})：多次重试仍连不上平台 ${DEFAULT_PLATFORM}，通常是本机网络或代理(如 Clash)波动。`);
+    console.error('  · 若刚在跑 video-analyze：视频多半已提交、平台在后台继续分析、积分不会白扣；网络恢复后用');
+    console.error('    chenyu-pro video-fetch --project <剧名或id片段>   零积分取回，切勿整批重跑(会重复扣分)。');
+    console.error('  · 检查网络/代理后重试；确需经代理到平台可设环境变量 CHENYU_KEEP_PROXY=1。');
+    process.exit(1);
+  }
+  console.error('✗ 出错: ' + (err?.stack || err?.message || err));
+  process.exit(1);
+}
