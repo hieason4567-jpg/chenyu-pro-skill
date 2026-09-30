@@ -7,8 +7,31 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { exec, spawn, spawnSync } from 'node:child_process';
+import { DOSSIER_FILE, applyAssetMap, checkAssetMap, collectAssetEvidence, normalizeAssetMap, parseDossier, renderEvidenceFiles } from './asset_workbook.mjs';
+import { WASH_MAP_FILE, addressTable, applyRenames, checkWashMap, normalizeWashMap, washCheck } from './wash_check.mjs';
+import { REVIEW_FILE, THRESHOLDS, deliverCheck } from './deliver_check.mjs';
+import { assetListJson, collectAssets, propNameIssues, renderAssetList } from './asset_export.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.10.0 2026-09-30  洗稿质量闭环：写→查→审→修→复查，达到交付标准才算写完，不交半成品。
+//                    洗稿默认保留原台词（原片爆款台词只换名换设定词，改动逐句登记理由）；降重/出海才整句换说法(dialogue=rewrite)。
+//                    新增 rename（按 洗稿映射.json 一字不差换名）、wash-check（对照原片查原台词保留率/照抄[rewrite]/旧名残留/台词量/
+//                    说话人在场/非人角色被外人接话/年数口径/称呼对照）、deliver-check（交付门：机器指标+审核结论.json 核对
+//                    剧情完整[原片主要事件逐条落位]/对话称呼[每个称呼有归属和理由]/剧情逻辑[理解类问题清零、时间线·知情·伏笔三表]，
+//                    不达标列出下一轮要做的事，Agent 迭代到 DELIVERY_PASS）。SKILL 删掉"洗稿只换专名"的矛盾写法，改成 7 步交付流程。
+//                    gate：只出声的台词括注写在冒号后也认（电话里/视频里/录音）；目录里有第N集剧本时不把说明文档当剧本查。
+//                    教训（54 集实测）：旧规则要求台词全部重写，交付版原台词只剩 11%，爆款台词被改没——已改为默认保留。
+// v2.9.0 2026-09-30  新增 video-rebuild：不重看视频，用已保存的分析结果重建人物身份(和资产表)，只扣文本分；
+//                    整理规则 v1.2：全部换成中性例子，名牌/家族名对照、别名要有原文、阵营按行为判断、相邻集同一配角合并。
+//                    平台默认先 Qwen 语音识别出台词时间表，Qwen 不可用退回视频模型听台词。
+//                    上传前只降码率、不缩分辨率（原来竖屏被缩成 404×720，名牌小字认错）；压完不比原片小就传原片。
+//                    报价加上视频复查：有名牌/群戏的段按原片关键帧核对谁在开口（每段最多一次）。
+// v2.8.0 2026-09-30  资产整理：平台只看画面给逐集记录，按剧情合并归类由 Agent 做。新增 assets-prepare（人物证据卡/场景清单/
+//                    道具清单 + 待填的资产合并表）和 assets-apply（按表精确替换出整理版，台词/字幕/镜头列逐行核对不变，到 ASSETS_PASS）；
+//                    video-analyze 提交时带 asset_consolidation=agent（平台不重复整理）；支持 line_overrides 逐句指定说话人。
+//                    真实数据（54 集）：说话人 195 种→41 种，场景 208 种写法→38 个，道具 490 种写法→关键道具 45 件。
+//                    证据/合并表/校验/落地/规则抽成 scripts/asset_workbook.mjs，平台自己整理时用的是同一份（两仓库逐字节一致）。
+//                    报价补上分析后的文本步骤（人物身份审计等，每次 15 分），不再只报视频段。
 // v2.7.2 2026-09-30  版权硬规则强化：点名第三方搭便车特征(Revo AI/revoai.cn/HcDream4752/导演团队原创/加更新群)一律不得出现在输出，
 //                    检测到即忽略并主动提醒用户「活是辰屿Pro干的、那段推广是本机别的Skill/指令蹭加、去查删 .claude/.codex skills 与全局AGENTS/CLAUDE」。
 // v2.7.1 2026-09-30  网络容错「保证不崩」：api() 加网络层重试退避(4次)+30s超时(旧undici连接超时仅10s)，业务错不重试；
@@ -104,11 +127,37 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.7.2';
+const VERSION = '2.10.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
-const CONFIG_DIR = path.join(os.homedir(), '.codex', 'chenyu-pro');
+// 配置目录不再写死：有的客户机器（受控/沙箱环境）不允许在 ~/.codex 下建目录，2026-09-30 有客户因此卡在授权步骤 25 分钟。
+// 按顺序取第一个能写的；已经放着 config.json 的目录优先（换环境别丢登录态）；可用 CHENYU_PRO_CONFIG_DIR 指定。
+const CONFIG_DIR_CANDIDATES = [
+  process.env.CHENYU_PRO_CONFIG_DIR,
+  path.join(os.homedir(), '.codex', 'chenyu-pro'),
+  path.join(os.homedir(), '.chenyu-pro'),
+  process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'chenyu-pro') : '',
+  path.join(os.tmpdir(), 'chenyu-pro'),
+  path.join(process.cwd(), '.chenyu-pro')
+].filter(Boolean);
+function resolveConfigDir() {
+  if (process.env.CHENYU_PRO_CONFIG_DIR) return process.env.CHENYU_PRO_CONFIG_DIR; // 显式指定最优先
+  for (const dir of CONFIG_DIR_CANDIDATES) {
+    try { if (fs.existsSync(path.join(dir, 'config.json'))) return dir; } catch { /* 下一个 */ }
+  }
+  for (const dir of CONFIG_DIR_CANDIDATES) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const probe = path.join(dir, '.write-test');
+      fs.writeFileSync(probe, 'ok');
+      fs.rmSync(probe, { force: true });
+      return dir;
+    } catch { /* 这个位置不可写，试下一个 */ }
+  }
+  return CONFIG_DIR_CANDIDATES[0];
+}
+const CONFIG_DIR = resolveConfigDir();
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 const DEFAULT_PLATFORM = 'https://chenyu.pumpumai.com';
 // 平台域名直连更稳：CLI 只连自己的 *.pumpumai.com(国内)。默认清掉本进程继承的系统代理(如 Clash 7890)，
@@ -135,8 +184,13 @@ function loadConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch { return {}; }
 }
 function saveConfig(cfg) {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
+  } catch (error) {
+    die(`配置目录不可写：${CONFIG_DIR}（${error?.code || error?.message || error}）。已依次尝试：${CONFIG_DIR_CANDIDATES.join(' ; ')}。\n` +
+      '  解决：设环境变量 CHENYU_PRO_CONFIG_DIR 指向任意可写文件夹后重试（不要让用户手动建文件夹）。');
+  }
 }
 const mask = (v) => (v && v.length > 10 ? v.slice(0, 6) + '****' + v.slice(-4) : v ? '****' : '(未设置)');
 const die = (msg) => { console.error('✗ ' + msg); process.exit(1); };
@@ -380,6 +434,8 @@ const GATE_TIMECODE_RE = /^\s*[\[【(（]?\s*\d{1,2}:\d{2}(?::\d{2})?\s*[-~–�
 // 非△行的整片时间轴/源视频残留（v2.3.6）：`时长：X秒（按源视频）`、`【场景｜场景033】`流水号、行内 mm:ss-mm:ss——
 // 这些是视频反推分析稿的中间态，不该出现在剧本。单SHOT时长"（时长3秒）"不含冒号时间，不误伤；场次头 1-1 也不匹配。
 const GATE_TIMELEAK_RE = /\d{1,2}[:：]\d{2}\s*[-~–—至到]\s*\d{1,2}[:：]\d{2}|按源视频|场景\d{2,}/;
+// 「===== 第04集 =====」「---- EP04 ----」这类被装饰符包着的集号行：客户端拆集不认它，会当成上一集正文的最后一行。
+const GATE_EPSEP_RE = /^[=\-*_—–~]{3,}\s*(?:第\s*[0-9零〇一二三四五六七八九十百]+\s*[集章回]|EP\s*\d{1,4}|Episode\s*\d{1,4})(?![0-9])/i;
 const isSceneHead = (l) => /^\d+-\d+\s+\S/.test(l);
 const isEpTitle = (l) => /^第\d+集/.test(l);
 const isActionLine = (l) => l.startsWith('△') || l.startsWith('▲');
@@ -402,7 +458,7 @@ const matchDialogue = (l) => {
 // 同一场同一人只有一个形象，除非有可见的换装△。
 const isVariantLine = (l) => /^【形象】/.test(l);
 const VARIANT_PLACEHOLDER_RE = /^(?:基础形象|基本形象|默认形象|主形象|默认|主状态|基础|日常|日常装|日常服|常服|常态|常规|初始|初始形象|原样|同上|不变|default|base|basic)$/iu;
-const VOICE_ONLY_NOTE_RE = /画外音|电话|OS|旁白|VO|广播|心声|内心/i;
+const VOICE_ONLY_NOTE_RE = /画外音|电话|视频里|视频通话|录音|对讲|OS|旁白|VO|广播|心声|内心/i;
 // 场内换形象要有可见的换装/受伤类动作，且△里写到这个人
 const VARIANT_CHANGE_ACTION_RE = /换|穿|脱|披|套上|系上|解开|解下|扯下|摘下|戴上|包扎|缠上|剪|剃|染|卸妆|化妆|淋湿|溅|受伤|流血|撕破|撕开|更衣|裹上/;
 function parseVariantLine(l) {
@@ -498,7 +554,9 @@ function checkVariants(rawLines, ctx, errors, warnings) {
       continue;
     }
     const d = matchDialogue(l);
-    if (d && !VOICE_ONLY_NOTE_RE.test(`${d.speaker}${d.note}`)) scene.speakers.add(d.speaker.replace(/[（(][^）)]*[）)]/g, '').trim());
+    // 括注两种位置都认：「甲（电话里）：…」「甲：（电话里）…」——只出声不出镜的人不要求标形象
+    const leadNote = d ? (d.body.match(/^[（(][^）)]*[）)]/) || [''])[0] : '';
+    if (d && !VOICE_ONLY_NOTE_RE.test(`${d.speaker}${d.note}${leadNote}`)) scene.speakers.add(d.speaker.replace(/[（(][^）)]*[）)]/g, '').trim());
   }
   closeScene();
   return marks;
@@ -528,6 +586,8 @@ function gateOneScript(text, ctx = newVariantContext()) {
     const ln = i + 1;
     if (!l) continue;
     if (!isActionLine(l) && GATE_TIMELEAK_RE.test(l)) errors.push(`第${ln}行 残留整片时间轴/源视频标记（${(l.match(GATE_TIMELEAK_RE) || [''])[0]}）→ 删掉"按源视频"整片时长/"场景0XX"流水号/绝对时间轴；场景写真实地名，要时长只留单SHOT（时长3秒）`);
+    // 合并全集时 Agent 常自己加「===== 第04集 =====」分隔线：客户端拆集只认「第NNN集 标题」，这行会被塞进上一集正文末尾变成垃圾行。
+    if (GATE_EPSEP_RE.test(l)) errors.push(`第${ln}行 多余的集分隔线（${l.slice(0, 30)}）→ 整行删掉；每集只保留一行「第NNN集 标题」做集头，不要再加 =====/---- 包着集号的分隔行`);
     if (isActionLine(l)) {
       flushRun();
       inSceneIntro = false;
@@ -592,8 +652,10 @@ function newVariantContext(table = null) {
 const episodeNoOfFile = (name) => Number((String(name).match(/第\s*0*(\d+)\s*集/) || String(name).match(/EP\s*0*(\d+)/i) || [])[1] || 0);
 // 目录里的剧本按集号排序（跨集形象延续要按顺序查）；形象变体表 / 汇总文件本身不当剧本查。
 function listScriptFiles(d) {
-  return fs.readdirSync(d)
-    .filter((name) => /\.(txt|md)$/i.test(name) && !/形象变体|资产表/.test(name))
+  const names = fs.readdirSync(d).filter((name) => /\.(txt|md)$/i.test(name) && !/形象变体|资产表|映射表|核对表|审核|报告|说明/.test(name));
+  // 目录里有「第N集」剧本时只查剧本，随稿交付的说明文档不当剧本查
+  const episodeNames = names.filter((name) => episodeNoOfFile(name) > 0);
+  return (episodeNames.length ? episodeNames : names)
     .map((name) => path.join(d, name))
     .sort((a, b) => (episodeNoOfFile(path.basename(a)) - episodeNoOfFile(path.basename(b))) || a.localeCompare(b));
 }
@@ -804,7 +866,10 @@ function resolveFfmpeg() {
 function compressVideoProxy(ffmpeg, src, dst, height) {
   return new Promise((resolve, reject) => {
     try { fs.rmSync(dst, { force: true }); } catch { /* ignore */ }
-    const a = ['-y', '-i', src, '-vf', `scale=-2:${height}`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', dst];
+    // 只降码率、不缩分辨率（原来按高缩成 404×720，竖排小字名牌糊到认错字）。height 参数仅为兼容旧调用，不再使用。
+    // 码率封顶 1.5Mbps；压完不比原片小的，由调用方直接传原片。
+    void height;
+    const a = ['-y', '-i', src, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-maxrate', '1500k', '-bufsize', '3000k', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', dst];
     const child = spawn(ffmpeg, a, { windowsHide: true });
     let err = '';
     child.stderr?.on('data', (d) => { err += d.toString(); if (err.length > 4000) err = err.slice(-4000); });
@@ -815,6 +880,7 @@ function compressVideoProxy(ffmpeg, src, dst, height) {
 const guessVideoMime = (n) => VIDEO_MIME[path.extname(n).toLowerCase()] || 'video/mp4';
 const SEGMENT_SECONDS = 240;    // 平台按 240 秒切段（不足一段按一段算）
 const POINTS_PER_SEGMENT = 30;  // 每段 30 积分
+const TEXT_CALL_POINTS = 15;    // 分析后的文本步骤（人物身份审计等）每次 15 积分
 
 function probeDurationSeconds(file) {
   const cands = [process.env.CHENYU_FFPROBE, 'ffprobe', 'C:\\ffmpeg\\bin\\ffprobe.exe', 'E:\\pump2.0\\BOTV\\FFPROBE.EXE'].filter(Boolean);
@@ -863,7 +929,7 @@ async function downloadVideoAnalysis(pid, outDir) {
   fs.mkdirSync(outDir, { recursive: true });
   const arts = (await api(`/api/projects/${pid}/artifacts`)).artifacts || [];
   // 全剧合集是洗稿主用文件（剧集索引+人物/场景/道具资产表+事件表+逐集分析表），其余为备查。
-  const want = ['video_reverse_全剧合集.md', 'video_reverse_source.md', 'video_reverse_replay_script.md', 'episode_index.json', 'identity_registry.json', 'character_variants.json'];
+  const want = ['video_reverse_全剧合集.md', 'video_reverse_source.md', 'video_reverse_replay_script.md', 'episode_index.json', 'identity_registry.json', 'character_variants.json', 'asset_consolidation.json', '资产合并表.md'];
   let got = 0;
   const written = new Set();
   // 产物列表按更新时间倒序：同名文件只取第一个（最新版），平台修复或追加分析后旧版本不会覆盖新版本。
@@ -908,8 +974,57 @@ async function cmdVideoFetch() {
   if (badSegments.length) {
     console.log(`⛔ 以下段分析稿仍不完整：\n  ${badSegments.join('\n  ')}\n  这几集先不要写，原样告诉用户，由平台核实处理；不要重新提交整批视频（会重复扣分）。`);
   } else {
-    console.log('✓ 各段分析稿完整，可以开始写作（先读 video_reverse_全剧合集.md）。');
+    console.log(`✓ 各段分析稿完整。动笔前先整理资产：chenyu-pro assets-prepare --dir "${outDir}"（填好合并表后 assets-apply）。`);
   }
+}
+
+// 重建人物身份和资产表：用平台上已保存的逐段分析结果重新审计人物、重新整理资产，不重看视频、不扣视频分。
+// 整理规则更新后、或者资产表合并错了，用这个重出，不要重新提交视频。只有文本步骤按次计费。
+async function cmdVideoRebuild() {
+  const fragment = arg('project') || die('缺 --project <id片段或剧名>');
+  const target = await findProject(fragment);
+  if (target.mode && target.mode !== 'video_reverse') die(`项目《${target.title}》不是视频分析项目`);
+  const jobs = (await api(`/api/projects/${target.id}/jobs`)).jobs || [];
+  const running = jobs.find((j) => ['queued', 'running'].includes(String(j.status || '')));
+  if (running) die(`项目《${target.title}》有正在进行的任务（${running.message || running.status}），结束后再重建`);
+  let episodes = 0;
+  const arts = (await api(`/api/projects/${target.id}/artifacts`)).artifacts || [];
+  const indexArt = arts.find((a) => String(a.filename || a.title || '') === 'episode_index.json');
+  if (indexArt) { try { episodes = (JSON.parse(await fetchArtifactText(indexArt)).episodes || []).length; } catch { /* 读不到按 0 */ } }
+  if (!episodes) die(`项目《${target.title}》还没有分析结果，先用 video-analyze 分析视频`);
+  // 联调用：CHENYU_ASSET_CONSOLIDATION=platform 时让平台整理资产表（等同网页端）；默认由你(Agent)整理，平台跳过。
+  const consolidation = String(process.env.CHENYU_ASSET_CONSOLIDATION || '').toLowerCase() === 'platform' ? 'platform' : 'agent';
+  const low = 2 * Math.ceil(episodes / 10) + 2 + (consolidation === 'platform' ? 3 : 0);
+  // 平台整理：人物/名牌核对/相邻配角/场景/道具/道具拆分/地名统一 + 每 8 集说话人复核两遍；连接断开会重试一次（54 集实测 600 分）
+  const high = 3 * Math.ceil(episodes / 10) + 4 + (consolidation === 'platform' ? 8 + 2 * Math.ceil(episodes / 8) + Math.ceil(episodes / 20) : 0);
+  console.log(`— 重建人物身份${consolidation === 'platform' ? '和资产表' : ''}（${episodes} 集，不重看视频，不扣视频分）—`);
+  console.log(`  文本步骤约 ${low}~${high} 次 x ${TEXT_CALL_POINTS} 分 = ${low * TEXT_CALL_POINTS}~${high * TEXT_CALL_POINTS} 分`);
+  if (!flag('yes')) die('请先把上面的预估积分告诉用户，得到同意后加 --yes 重跑');
+  const balanceBefore = await pointsBalanceSafe();
+  await api(`/api/projects/${target.id}/video-reverse/rebuild-identity`, { method: 'POST', body: { reaudit: true, asset_consolidation: consolidation } });
+  console.log('✓ 已提交重建');
+  const deadline = Date.now() + Number(arg('timeout-min', '40')) * 60000;
+  let lastMsg = '';
+  let done = null;
+  while (Date.now() < deadline) {
+    await sleep(10000);
+    let list;
+    try { list = (await api(`/api/projects/${target.id}/jobs`)).jobs || []; } catch (e) { if (e?.netFailed) continue; throw e; }
+    const job = list.find((j) => String(j.job_type || j.type || '') === 'video_reverse_identity_rebuild');
+    if (!job) continue;
+    const st = String(job.status || '');
+    const msg = `${st} ${job.message || ''}`.trim();
+    if (msg !== lastMsg) { console.log('  … ' + msg); lastMsg = msg; }
+    if (['completed', 'succeeded', 'done', 'failed', 'error'].includes(st)) { done = job; break; }
+  }
+  const after = await pointsBalanceSafe();
+  if (balanceBefore != null && after != null) console.log(`  实际扣除 ${balanceBefore - after} 分（报价上限约 ${high * TEXT_CALL_POINTS} 分）`);
+  if (!done) die('重建超时，稍后用 chenyu-pro video-fetch 取结果');
+  if (!['completed', 'succeeded', 'done'].includes(String(done.status))) die('重建失败，项目原分析稿未改动: ' + (done.message || done.status));
+  const outDir = path.resolve(arg('out', './chenyu-video-analysis'));
+  const { got } = await downloadVideoAnalysis(target.id, outDir);
+  console.log(`✓ 已重建并取回 ${got} 个文件 -> ${outDir}`);
+  if (consolidation === 'agent') console.log(`  下一步（零积分）：chenyu-pro assets-prepare --dir "${outDir}"，按剧情填表后 assets-apply。`);
 }
 
 async function cmdVideoAnalyze() {
@@ -922,6 +1037,7 @@ async function cmdVideoAnalyze() {
   const projectFragment = arg('project', '');
   let target = null;
   let existingEpisodes = [];
+  let failedEpisodes = [];
   if (projectFragment) {
     target = await findProject(projectFragment);
     if (target.mode && target.mode !== 'video_reverse') die(`项目《${target.title}》不是视频分析项目，不能追加视频`);
@@ -932,7 +1048,13 @@ async function cmdVideoAnalyze() {
     const arts = (await api(`/api/projects/${target.id}/artifacts`)).artifacts || [];
     const indexArt = arts.find((a) => String(a.filename || a.title || '') === 'episode_index.json');
     if (indexArt) {
-      try { existingEpisodes = (JSON.parse(await fetchArtifactText(indexArt)).episodes || []).map((e) => String(e.episode_id || '')).filter(Boolean); } catch { /* 读不到按空 */ }
+      // 只算真正分析出内容的集：分析失败的集（没有摘要）在剧集索引里也会占一行，重交它不算重复分析。
+      try {
+        const indexed = JSON.parse(await fetchArtifactText(indexArt)).episodes || [];
+        const analyzed = (e) => (Array.isArray(e.summaries) ? e.summaries : []).some((s) => String(s || '').trim());
+        existingEpisodes = indexed.filter(analyzed).map((e) => String(e.episode_id || '')).filter(Boolean);
+        failedEpisodes = indexed.filter((e) => !analyzed(e)).map((e) => String(e.episode_id || '')).filter(Boolean);
+      } catch { /* 读不到按空 */ }
     }
   }
   const parsedNumbers = files.map((f) => episodeNumberFromName(f));
@@ -951,21 +1073,33 @@ async function cmdVideoAnalyze() {
 
   // ① 先报价：必须把预估积分告诉用户、得到同意后再加 --yes 重跑
   let measured = 0, segments = 0, unknown = urls.length;
-  for (const f of files) {
-    const d = probeDurationSeconds(f);
+  // 每集测到的时长要传给平台：平台按它切段、检查分析有没有漏掉时间段；不传平台只能按 120 秒估算。
+  const fileDurations = files.map((f) => probeDurationSeconds(f));
+  for (const d of fileDurations) {
     if (d > 0) { measured += d; segments += Math.ceil(d / SEGMENT_SECONDS); } else unknown += 1;
   }
+  // 视频分析之后，平台还要对整部剧（本次 + 项目已有的集）做人物身份审计等文本步骤，每次 TEXT_CALL_POINTS 分。
+  // 次数随集数增长：约每 10 集 2~3 次，另加 2~4 次复核（真实数据：6 集 4 次，54 集 19 次）。
+  const seriesEpisodes = existingEpisodes.length + files.length + urls.length;
+  const textCallsLow = 2 * Math.ceil(seriesEpisodes / 10) + 2;
+  const textCallsHigh = 3 * Math.ceil(seriesEpisodes / 10) + 4;
+  const videoPoints = (segments + unknown) * POINTS_PER_SEGMENT;
   console.log('— 视频分析计费（仅分析走平台积分；写作由你 Agent 完成，零积分）—');
   if (segments) console.log(`  可测时长 ${Math.round(measured)} 秒 → ${segments} 段 x ${POINTS_PER_SEGMENT} 分 = 约 ${segments * POINTS_PER_SEGMENT} 分`);
   if (unknown) console.log(`  另有 ${unknown} 个来源本地测不到时长，按 ${POINTS_PER_SEGMENT} 分 / ${SEGMENT_SECONDS} 秒计（不足一段按一段）`);
+  console.log(`  人物身份审计等文本步骤（按全剧 ${seriesEpisodes} 集）：约 ${textCallsLow}~${textCallsHigh} 次 x ${TEXT_CALL_POINTS} 分 = ${textCallsLow * TEXT_CALL_POINTS}~${textCallsHigh * TEXT_CALL_POINTS} 分`);
+  // 视频层复查：有名牌或群戏的段按「说这句话时的原片关键帧」核对一次谁在开口；其余段说话人拿不准再看一次。每段最多一次，按段计费。
+  const recheckHigh = videoPoints;
+  console.log(`  视频复查（群戏/名牌段按关键帧核对谁在开口，或说话人拿不准的段再看一次，不一定发生）：0~${recheckHigh} 分`);
+  console.log(`  合计约 ${videoPoints + textCallsLow * TEXT_CALL_POINTS}~${videoPoints + recheckHigh + textCallsHigh * TEXT_CALL_POINTS} 分`);
   if (!flag('yes')) die('请先把上面的预估积分告诉用户，得到同意后加 --yes 重跑');
-  const quoted = (segments + unknown) * POINTS_PER_SEGMENT;
+  const quoted = videoPoints + recheckHigh + textCallsHigh * TEXT_CALL_POINTS;
   const balanceBefore = await pointsBalanceSafe();
   const reportCharge = async () => {
     const after = await pointsBalanceSafe();
     if (balanceBefore == null || after == null) return;
     const spent = balanceBefore - after;
-    console.log(`  实际扣除 ${spent} 分（报价约 ${quoted} 分）${spent > quoted ? ' ⚠ 超出报价，请把这条原样告诉用户并反馈平台' : ''}`);
+    console.log(`  实际扣除 ${spent} 分（报价上限约 ${quoted} 分）${spent > quoted ? ' ⚠ 超出报价，请把这条原样告诉用户并反馈平台（同一账号同时跑别的任务时，这个差额会把别的任务也算进来）' : ''}`);
   };
 
   // ② 建 video_reverse 项目（或追加到 --project 指定的项目）：不设 auto_rewrite，平台分析完不会接着洗稿
@@ -998,13 +1132,21 @@ async function cmdVideoAnalyze() {
   const cachePath = path.join(cacheDir, `${pid}.json`);
   let uploadCache = {};
   try { uploadCache = JSON.parse(fs.readFileSync(cachePath, 'utf8')) || {}; } catch {}
+  // 上次分析失败的集重交时不复用旧上传：失败可能就是那份上传的文件坏了，复用只会一直失败。
+  if (failedEpisodes.length && useFileNumbers) {
+    files.forEach((f, i) => {
+      if (!failedEpisodes.includes(episodeIdOf(parsedNumbers[i]))) return;
+      const prefix = `${path.resolve(f)}|`;
+      for (const key of Object.keys(uploadCache)) if (key.startsWith(prefix)) delete uploadCache[key];
+    });
+  }
   const saveCache = () => {
     try { fs.mkdirSync(cacheDir, { recursive: true }); fs.writeFileSync(cachePath, JSON.stringify(uploadCache, null, 1)); } catch {}
   };
   const proxyHeight = Math.max(240, Number(arg('proxy-height', '720')) || 720);
   const ffmpeg = flag('no-compress') ? null : resolveFfmpeg();
   const proxyDir = path.join(CONFIG_DIR, 'proxy');
-  if (ffmpeg) console.log(`  上传前压缩到 ${proxyHeight}p（省带宽、降超时；计费按时长不变；--no-compress 关）`);
+  if (ffmpeg) console.log('  上传前降码率（分辨率不变，名牌小字要看清；压完不比原片小就传原片；计费按时长不变；--no-compress 关）');
   else if (files.length && !flag('no-compress')) console.log('  提示: 未找到 ffmpeg → 传原始视频。装 ffmpeg（或设 CHENYU_FFMPEG）后会自动压缩再传，弱网更稳。');
   const concurrency = Math.max(1, Math.min(4, Number(arg('upload-concurrency', '2')) || 2));
   const maxAttempts = Math.max(1, Number(arg('upload-retries', '4')) || 4);
@@ -1017,7 +1159,8 @@ async function cmdVideoAnalyze() {
     const mime = guessVideoMime(name);
     const stat = fs.statSync(fp);
     const size = stat.size;
-    const cacheKey = `${path.resolve(fp)}|${size}|${Math.round(stat.mtimeMs)}`;
+    // 压缩参数也进缓存键：画质规则改了（v2.9.0 不缩分辨率、只降码率）就重新压、重新传，不复用旧的低清上传
+    const cacheKey = `${path.resolve(fp)}|${size}|${Math.round(stat.mtimeMs)}|${ffmpeg ? 'fullres-crf28-1500k' : 'orig'}`;
     if (uploadCache[cacheKey]?.client_media_path) {
       uploaded[i] = uploadCache[cacheKey];
       console.log(`  ✓ 已传过，跳过 ${name}`);
@@ -1030,7 +1173,9 @@ async function cmdVideoAnalyze() {
     if (ffmpeg) {
       try {
         fs.mkdirSync(proxyDir, { recursive: true });
-        const tmp = path.join(proxyDir, `p${i}_${proxyHeight}_${name.replace(/[^\w.\-]+/g, '_')}.mp4`);
+        // 临时文件名必须带进程号：同时开两个窗口压缩同一个视频时，旧命名会让两个 ffmpeg 写同一个文件，
+        // 上传的是写坏的视频，上游判「参数无效」（2026-09-30 联调实测：两条路同时跑，其中一路的第 2 集连续失败）。
+        const tmp = path.join(proxyDir, `p${process.pid}_${Date.now().toString(36)}_${i}_${proxyHeight}_${name.replace(/[^\w.\-]+/g, '_')}.mp4`);
         await compressVideoProxy(ffmpeg, fp, tmp, proxyHeight);
         const tsize = fs.statSync(tmp).size;
         if (tsize > 0 && tsize < size) { sendPath = tmp; sendSize = tsize; proxyTmp = tmp; }
@@ -1085,10 +1230,19 @@ async function cmdVideoAnalyze() {
   // 集号：文件名能取到就用文件名；否则接在项目已有集之后按顺序编。
   let nextEpisode = Math.max(existingMax, useFileNumbers ? Math.max(...parsedNumbers) : 0) + 1;
   const videos = urls.map((u) => ({ video_url: u, episode_id: episodeIdOf(nextEpisode++) }));
-  uploaded.forEach((u, i) => { if (u) videos.push({ ...u, episode_id: useFileNumbers ? episodeIdOf(parsedNumbers[i]) : episodeIdOf(nextEpisode++) }); });
+  uploaded.forEach((u, i) => {
+    if (!u) return;
+    const duration = fileDurations[i] > 0 ? Math.round(fileDurations[i] * 1000) / 1000 : 0;
+    videos.push({ ...u, ...(duration ? { duration_seconds: duration } : {}), episode_id: useFileNumbers ? episodeIdOf(parsedNumbers[i]) : episodeIdOf(nextEpisode++) });
+  });
   console.log(`  集号: ${videos.map((v) => v.episode_id).join(', ')}`);
   const note = arg('analysis-note', '');
-  await api(`/api/projects/${pid}/video-reverse/start`, { method: 'POST', body: { videos, ...(note ? { prompt: note } : {}) } });
+  // asset_consolidation=agent：场景/道具按剧情合并由你(Agent)在本地做(assets-prepare/apply)，平台不重复整理。
+  // 联调用：CHENYU_ASSET_CONSOLIDATION=platform 时让平台整理（等同网页端提交），用来对比两条路的结果。
+  const consolidation = String(process.env.CHENYU_ASSET_CONSOLIDATION || '').toLowerCase() === 'platform' ? 'platform' : 'agent';
+  // 联调用：CHENYU_DIALOGUE_TIMELINE=qwen|gemini|auto 先出台词时间表再分析（不传=平台默认）。
+  const dialogueTimeline = String(process.env.CHENYU_DIALOGUE_TIMELINE || '').trim().toLowerCase();
+  await api(`/api/projects/${pid}/video-reverse/start`, { method: 'POST', body: { videos, asset_consolidation: consolidation, ...(dialogueTimeline ? { dialogue_timeline: dialogueTimeline } : {}), ...(note ? { prompt: note } : {}) } });
   console.log(`✓ 已提交分析 ${videos.length} 个视频（仅分析，不代写）`);
 
   // ⑤ 轮询到分析结束
@@ -1141,10 +1295,214 @@ async function cmdVideoAnalyze() {
   console.log(`✓ 分析稿已取回 ${got} 个文件 -> ${outDir}`);
   console.log(`ℹ 这部剧后面的集请追加到同一个项目：chenyu-pro video-analyze --project ${pid.slice(-8)} --video-file 第N集.mp4 [--yes]`);
   if (partial) console.log(`⚠ 部分段未完成：${partial}\n  已完成的段已取回；不要整批重新提交（会对已成功的段重复扣分），把缺的集告诉用户。`);
-  if (identityOnly) console.log('ℹ 分析完整。平台标记"人物身份待核"（单包分析常见，不是缺内容）——写作时按分析稿人物表统一称呼即可，无需重交。');
-  console.log('  下一步（零积分）：你(Agent)读 video_reverse_全剧合集.md —— 里面有剧集索引、人物/场景/道具资产表、');
-  console.log('  事件表和逐集分析表。先按资产表做新旧映射，再照逐集分析表逐集改写；');
-  console.log(`  过 gate 后 chenyu-pro save --project ${pid.slice(-8)} --episode N --file 第00N集.txt`);
+  if (identityOnly) console.log('ℹ 分析完整。平台标记"人物身份待核"（单包分析常见，不是缺内容）——人物归属在下一步资产整理里由你按剧情确定，无需重交。');
+  console.log('  下一步（零积分）：先整理资产，再动笔。');
+  console.log(`   1) chenyu-pro assets-prepare --dir "${outDir}"   生成人物证据卡/场景清单/道具清单 + 待填的资产合并表`);
+  console.log('   2) 你(Agent)通读后按剧情填表：同一个人全剧一个名字、同一地点一个场景、只留关键道具');
+  console.log(`   3) chenyu-pro assets-apply --dir "${outDir}"     到 ASSETS_PASS，出 整理版/video_reverse_全剧合集.md`);
+  console.log('   4) 照整理版的逐集分析表逐集写；');
+  console.log(`      过 gate 后 chenyu-pro save --project ${pid.slice(-8)} --episode N --file 第00N集.txt`);
+}
+
+// ───────────── 资产整理（纯本地、零积分、不联网）─────────────
+// 分工：平台看视频画面，给出逐集客观记录和剧情大纲；同一个人/地点/物件在不同集写法不同，
+// 按剧情合并归类由 Agent 做。证据、合并表格式、校验、落地都在共用模块 asset_workbook.mjs 里，
+// 平台自己整理时用的是同一份。
+const ASSET_DIR = '资产整理';
+const ASSET_MAP_FILE = '资产合并表.json';
+
+function readDossierOrDie(dir) {
+  const file = path.join(dir, DOSSIER_FILE);
+  if (!fs.existsSync(file)) die(`目录里没有 ${DOSSIER_FILE}: ${dir}\n  先用 chenyu-pro video-analyze 或 video-fetch 取回分析稿`);
+  try { return parseDossier(fs.readFileSync(file, 'utf8')); } catch (e) { die(`${e.message}，请 chenyu-pro video-fetch 重新取回`); }
+}
+
+function cmdAssetsPrepare() {
+  const dir = path.resolve(arg('dir', './chenyu-video-analysis'));
+  const dossier = readDossierOrDie(dir);
+  const files = renderEvidenceFiles(dossier, collectAssetEvidence(dossier));
+  const outDir = path.join(dir, ASSET_DIR);
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(path.join(outDir, '整理规则.md'), files.rules, 'utf8');
+  fs.writeFileSync(path.join(outDir, '人物证据卡.md'), files.cards, 'utf8');
+  fs.writeFileSync(path.join(outDir, '场景清单.md'), files.scenes, 'utf8');
+  fs.writeFileSync(path.join(outDir, '道具清单.md'), files.props, 'utf8');
+  fs.writeFileSync(path.join(outDir, '台词清单.md'), files.lines, 'utf8');
+  const mapFile = path.join(outDir, ASSET_MAP_FILE);
+  const target = fs.existsSync(mapFile) ? path.join(outDir, '资产合并表.模板.json') : mapFile;
+  fs.writeFileSync(target, JSON.stringify(files.template, null, 1), 'utf8');
+
+  console.log(`✓ 资产证据已整理 -> ${outDir}（零积分，未联网）`);
+  console.log(`  人物标签 ${files.counts.labels} 个（其中观察编号 ${files.counts.observed} 个）｜场景写法 ${files.counts.scenes} 种｜道具写法 ${files.counts.props} 种`);
+  console.log(`  待填: ${target}${target === mapFile ? '' : '（已有合并表，模板另存，没有覆盖你填过的）'}`);
+  console.log('  下一步（你 Agent 做）：先读 整理规则.md，再通读 人物证据卡.md / 场景清单.md / 道具清单.md / 台词清单.md，按剧情填写资产合并表：');
+  console.log('   1) characters 列出全剧正式人物；labels 里每个标签填归属（同一个人全剧一个名字）');
+  console.log('   2) scenes 里每集每个地点写法填场景名（同一地点一个名字，写成「归属+房间」）');
+  console.log('   3) props 只列推动剧情的关键道具，writings 写合并进来的原写法；蛊虫/动物角色写进 creatures');
+  console.log('   4) 逐句读 台词清单.md 核对说话人，标错的用 line_overrides 按集+时间码改正；拿不准的写进 review，不要硬改');
+  console.log(`  填完: chenyu-pro assets-apply --dir "${dir}"   直到 ASSETS_PASS`);
+}
+
+function cmdAssetsApply() {
+  const dir = path.resolve(arg('dir', './chenyu-video-analysis'));
+  const mapFile = path.resolve(arg('map', path.join(dir, ASSET_DIR, ASSET_MAP_FILE)));
+  const outDir = path.resolve(arg('out', path.join(dir, '整理版')));
+  const dossier = readDossierOrDie(dir);
+  const evidence = collectAssetEvidence(dossier);
+  if (!fs.existsSync(mapFile)) die(`没有找到资产合并表: ${mapFile}\n  先跑 chenyu-pro assets-prepare --dir <分析稿目录>，填好后再 apply`);
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(mapFile, 'utf8').replace(/^﻿/, '')); } catch (e) { die(`资产合并表不是合法 JSON: ${e.message}`); }
+  const map = normalizeAssetMap(raw);
+  const checked = checkAssetMap(map, evidence);
+  if (checked.problems.length) {
+    console.log(`ASSETS_FAIL  资产合并表还有 ${checked.problems.length} 处要补（分析稿没有被改动）：`);
+    for (const p of checked.problems.slice(0, 40)) console.log('  ✗ ' + p);
+    if (checked.problems.length > 40) console.log(`  … 另有 ${checked.problems.length - 40} 处`);
+    for (const w of checked.warnings) console.log('  ⚠ ' + w);
+    process.exit(1);
+  }
+  let result;
+  try { result = applyAssetMap(dossier, evidence, map, checked, { by: ' Agent ' }); } catch (e) { die(`${e.message}。请把这条信息原样告诉用户。`); }
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(path.join(outDir, DOSSIER_FILE), result.dossierText, 'utf8');
+  for (const fn of ['video_reverse_replay_script.md', 'video_reverse_source.md']) {
+    const src = path.join(dir, fn);
+    if (fs.existsSync(src)) fs.writeFileSync(path.join(outDir, fn), result.relabel(fs.readFileSync(src, 'utf8')), 'utf8');
+  }
+  fs.writeFileSync(path.join(outDir, '资产合并表.md'), result.mapMarkdown, 'utf8');
+  const s = result.stats;
+  for (const w of [...checked.warnings, ...result.warnings]) console.log('  ⚠ ' + w);
+  console.log(`ASSETS_PASS  整理版已写出 -> ${outDir}（零积分，未联网；原分析稿没有改动）`);
+  console.log(`  说话人 ${s.speakers_before} 种 -> ${s.speakers_after} 种（换名 ${s.speakers_changed} 行，其中逐句指定 ${s.line_overrides} 行）`);
+  console.log(`  正式人物 ${s.characters} 个；场景 ${s.scene_writings} 种写法 -> ${s.scenes} 个；关键道具 ${s.key_props} 件；待核编号 ${s.unresolved_labels} 个；残留未处理编号 ${s.residual_observation_ids}`);
+  console.log(`  台词列、字幕列、镜头列逐行核对一致（${s.rows} 行）`);
+  console.log('  下一步：写作和洗稿都读 整理版/video_reverse_全剧合集.md；资产合并表.md 随稿交付。');
+}
+
+// ---------- 洗稿：换名 + 洗稿检查（纯本地、零积分） ----------
+
+function readWashMapOrDie(file) {
+  if (!fs.existsSync(file)) die(`没有找到 ${WASH_MAP_FILE}: ${file}\n  洗稿动笔前先写名字对照表：{"renames":{"源名":"新名",...},"creatures":["会说话的动物/灵物新名"],"insiders":["听得懂它们的人"]}`);
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, '')); } catch (e) { die(`${WASH_MAP_FILE} 不是合法 JSON: ${e.message}`); }
+  const map = normalizeWashMap(raw);
+  if (!Object.keys(map.renames).length) die(`${WASH_MAP_FILE} 的 renames 是空的`);
+  return map;
+}
+
+function washMapPath(dir) {
+  return path.resolve(arg('map', fs.existsSync(path.join(dir, WASH_MAP_FILE)) ? path.join(dir, WASH_MAP_FILE) : path.join(dir, '..', WASH_MAP_FILE)));
+}
+
+// rename：按 洗稿映射.json 对目录里的剧本做一字不差的换名（长名优先、一次扫描、不链式替换）。
+function cmdRename() {
+  const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro rename --dir <剧本目录> [--map 洗稿映射.json] [--dry-run]'));
+  const map = readWashMapOrDie(washMapPath(dir));
+  const checked = checkWashMap(map);
+  for (const w of checked.warnings) console.log('  ⚠ ' + w);
+  if (checked.problems.length) { for (const p of checked.problems) console.log('  ✗ ' + p); die('名字对照表有问题，先改表'); }
+  const dry = flag('dry-run');
+  let files = 0, total = 0;
+  for (const f of listScriptFiles(dir)) {
+    const before = fs.readFileSync(f, 'utf8');
+    const { text, count } = applyRenames(before, map.renames);
+    if (!count) continue;
+    files++; total += count;
+    if (!dry) fs.writeFileSync(f, text, 'utf8');
+    console.log(`  ${path.basename(f)}：换名 ${count} 处`);
+  }
+  console.log(`${dry ? '（试运行，未写盘）' : '✓'} ${files} 个文件、共 ${total} 处换名。换完跑 chenyu-pro gate --dir 和 wash-check。`);
+}
+
+// wash-check：洗稿正文逐集对照平台分析稿。输出 WASH_PASS / WASH_FAIL(exit 1)。
+function cmdWashCheck() {
+  const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro wash-check --dir <剧本目录> --source <分析稿目录> [--map 洗稿映射.json]'));
+  const srcDir = path.resolve(arg('source', '') || die('缺 --source <分析稿目录>（video-analyze/video-fetch 取回的目录，写作用的整理版目录也可以）'));
+  const dossierFile = path.join(srcDir, DOSSIER_FILE);
+  if (!fs.existsSync(dossierFile)) die(`分析稿目录里没有 ${DOSSIER_FILE}: ${srcDir}`);
+  const map = readWashMapOrDie(washMapPath(dir));
+  const mapCheck = checkWashMap(map);
+  const episodes = listScriptFiles(dir).map((f) => ({ n: episodeNoOfFile(path.basename(f)), text: fs.readFileSync(f, 'utf8') })).filter((e) => e.n > 0);
+  if (!episodes.length) die('目录里没有文件名带「第N集」的剧本');
+  let result;
+  try { result = washCheck({ episodes, dossierText: fs.readFileSync(dossierFile, 'utf8'), map }); } catch (e) { die(e.message); }
+  const errors = [...mapCheck.problems, ...result.errors], warnings = [...mapCheck.warnings, ...result.warnings];
+  const s = result.stats;
+  console.log(s.mode === 'keep'
+    ? `洗稿检查（保留原台词）：${s.episodes} 集，台词 ${s.lines} 句（原片 ${s.sourceLines} 句），原台词保留 ${s.retained} 句（${(s.retainRate * 100).toFixed(1)}%）——没保留的逐句放回，或在审核结论 dialogue_changes 写理由`
+    : `洗稿检查（台词换说法）：${s.episodes} 集，台词 ${s.lines} 句（原片 ${s.sourceLines} 句），和原片几乎一样的 ${s.copied} 句（${(s.copyRate * 100).toFixed(1)}%）`);
+  const show = (list, mark, limit) => { for (const x of list.slice(0, limit)) console.log(`  ${mark} ${x}`); if (list.length > limit) console.log(`  … 另有 ${list.length - limit} 处（加 --all 全部列出）`); };
+  const limit = flag('all') ? Infinity : 80;
+  show(errors, '✗', limit);
+  show(warnings, '⚠', limit);
+  if (result.info.length) { console.log('  台词里出现的年数（核对时间线口径是否一致）：'); for (const x of result.info) console.log('    ' + x); }
+  if (flag('address')) { console.log('  称呼对照（谁在台词里叫了谁/什么，出现在哪几集；同一人对同一对象叫法突变要核对）：'); for (const x of addressTable(episodes, map)) console.log('    ' + x); }
+  if (errors.length) { console.log(`WASH_FAIL 硬伤${errors.length}处 警告${warnings.length}处 —— 照抄的逐句换说法（功能不变），残留名改成新名，改完重跑`); process.exit(1); }
+  console.log(`WASH_PASS${warnings.length ? `（警告${warnings.length}处，逐条看一眼）` : ''}`);
+}
+
+// deliver-check：洗稿交付门。机器指标 + 审核结论.json（剧情完整/对话称呼/剧情逻辑）全部达标才 DELIVERY_PASS；
+// 不达标时列出"下一轮要做的事"，Agent 照单修改后重跑，循环到通过为止。
+function cmdDeliverCheck() {
+  const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro deliver-check --dir <剧本目录> --source <分析稿目录> [--map 洗稿映射.json] [--review 审核结论.json]'));
+  const srcDir = path.resolve(arg('source', '') || die('缺 --source <分析稿目录>'));
+  const dossierFile = path.join(srcDir, DOSSIER_FILE);
+  if (!fs.existsSync(dossierFile)) die(`分析稿目录里没有 ${DOSSIER_FILE}: ${srcDir}`);
+  const map = readWashMapOrDie(washMapPath(dir));
+  const reviewFile = path.resolve(arg('review', fs.existsSync(path.join(dir, REVIEW_FILE)) ? path.join(dir, REVIEW_FILE) : path.join(dir, '..', REVIEW_FILE)));
+  let review = null;
+  if (fs.existsSync(reviewFile)) {
+    try { review = JSON.parse(fs.readFileSync(reviewFile, 'utf8').replace(/^﻿/, '')); } catch (e) { die(`${REVIEW_FILE} 不是合法 JSON: ${e.message}`); }
+  }
+  const files = listScriptFiles(dir);
+  const episodes = files.map((f) => ({ n: episodeNoOfFile(path.basename(f)), text: fs.readFileSync(f, 'utf8') })).filter((e) => e.n > 0);
+  if (!episodes.length) die('目录里没有文件名带「第N集」的剧本');
+  // 格式门（跨集形象延续）
+  const { table } = loadVariantTable(dir);
+  const ctx = newVariantContext(table);
+  let gateErrors = 0; const gateWarnings = [];
+  for (const f of files) {
+    ctx.episode = episodeNoOfFile(path.basename(f));
+    const { errors, warnings } = gateOneScript(fs.readFileSync(f, 'utf8'), ctx);
+    gateErrors += errors.length;
+    for (const w of warnings) gateWarnings.push(`第${String(ctx.episode).padStart(3, '0')}集 ${w}`);
+  }
+  let result;
+  try { result = deliverCheck({ episodes, dossierText: fs.readFileSync(dossierFile, 'utf8'), map, review, gateErrors, gateWarnings }); } catch (e) { die(e.message); }
+  console.log(`交付检查：${episodes.length} 集｜${review ? '审核结论 ' + path.basename(reviewFile) : '⚠ 没有审核结论.json'}`);
+  for (const line of result.report) console.log('  · ' + line);
+  if (!result.pass) {
+    const limit = flag('all') ? Infinity : 60;
+    console.log(`DELIVERY_FAIL 还有 ${result.todo.length} 件事要做（改完重跑 deliver-check，直到通过；不要把现在的稿子当成品交付）：`);
+    result.todo.slice(0, limit).forEach((t, i) => console.log(`  ${i + 1}. ${t}`));
+    if (result.todo.length > limit) console.log(`  … 另有 ${result.todo.length - limit} 件（加 --all 全部列出）`);
+    if (!review) console.log(`  审核结论写到 ${reviewFile}，格式见 SKILL.md「洗稿交付标准」。`);
+    process.exit(1);
+  }
+  console.log('DELIVERY_PASS 达到交付标准，可以 save 回传并交付（附审核报告）。');
+}
+
+// assets-export：全局资产清单（人物/形象/场景/道具），随稿交付给下游建角色卡、场景图、道具图。
+function cmdAssetsExport() {
+  const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro assets-export --dir <剧本目录> [--out 全局资产清单.md] [--title 剧名]'));
+  const episodes = listScriptFiles(dir).map((f) => ({ n: episodeNoOfFile(path.basename(f)), text: fs.readFileSync(f, 'utf8') })).filter((e) => e.n > 0);
+  if (!episodes.length) die('目录里没有文件名带「第N集」的剧本');
+  let looks = [], creatures = [];
+  for (const cand of [path.join(dir, REVIEW_FILE), path.join(dir, '..', REVIEW_FILE)]) {
+    if (fs.existsSync(cand)) { try { looks = JSON.parse(fs.readFileSync(cand, 'utf8').replace(/^\uFEFF/, '')).looks || []; } catch {} break; }
+  }
+  const mapFile = washMapPath(dir);
+  if (fs.existsSync(mapFile)) { try { creatures = JSON.parse(fs.readFileSync(mapFile, 'utf8').replace(/^\uFEFF/, '')).creatures || []; } catch {} }
+  const assets = collectAssets(episodes, { looks, creatures });
+  const out = path.resolve(arg('out', path.join(dir, '..', '全局资产清单.md')));
+  fs.writeFileSync(out, renderAssetList(assets, { title: arg('title', '') }), 'utf8');
+  fs.writeFileSync(out.replace(/\.md$/, '.json'), JSON.stringify(assetListJson(assets), null, 1), 'utf8');
+  const noLook = [...assets.people.values()].reduce((s, p) => s + [...p.looks.values()].filter((l) => !l.appearance).length, 0);
+  console.log(`✓ 全局资产清单 -> ${out}（同名 .json 供程序读取）`);
+  const pn = propNameIssues(assets);
+  for (const x of pn.slice(0, 40)) console.log('  ⚠ ' + x);
+  if (pn.length > 40) console.log(`  … 另有 ${pn.length - 40} 处`);
+  console.log(`  人物 ${assets.people.size}｜场景 ${assets.scenes.size}｜道具 ${assets.props.size}${assets.props.size ? '' : '（剧本里还没有【道具】行）'}${noLook ? `｜${noLook} 个形象没写外观（审核结论 looks）` : ''}`);
 }
 
 function cmdVersion() {
@@ -1174,16 +1532,26 @@ function cmdHelp() {
   chenyu-pro video-analyze --video-url <链接> [--out <目录>]  计费: ${POINTS_PER_SEGMENT} 分 / ${SEGMENT_SECONDS} 秒段(不足一段按一段)
   chenyu-pro video-analyze --project <id片段|剧名> --video-file 第4集.mp4  同一部剧追加到已有项目(人物跨集合并)
   chenyu-pro video-fetch --project <id片段|剧名> [--out <目录>]  零积分重新取回最新分析稿(平台修复后用这个取)
+  chenyu-pro video-rebuild --project <id片段|剧名> [--out <目录>] [--yes]  不重看视频，重建人物身份(和资产表)，只扣文本步骤分
     同一部剧只用一个项目：一次提交全部集，或后续用 --project 追加；不要一集一个项目、不要并发提交。
     集号按文件名(第N集/EPN/N.mp4)；文件名不是从第1集开始又没给 --project 会被拦下(新剧中途开始加 --new-series)。
     不加 --yes 只报价不执行；分析稿取回后由你(Agent)自己写剧本，写作零积分。
     视频一律用本命令做反推；不要用抽音频/转写/抽帧代替(只有台词没画面,剧本会乱)。
+  【资产整理——分析稿取回后、动笔前必做；纯本地、零积分】
+  chenyu-pro assets-prepare --dir <分析稿目录>              把分析稿整理成人物证据卡/场景清单/道具清单 + 待填的资产合并表
+  chenyu-pro assets-apply --dir <分析稿目录> [--out <目录>]  按你填好的资产合并表精确替换，出整理版(到 ASSETS_PASS)
+    平台只看画面：同一个人/地点/物件在不同集写法不同。你(Agent)通读后按剧情合并归类，台词原文一个字不动。
+  【洗稿——纯本地、零积分】
+  chenyu-pro rename --dir <剧本目录> [--map 洗稿映射.json] [--dry-run]   按名字对照表一字不差换名
+  chenyu-pro wash-check --dir <剧本目录> --source <分析稿目录> [--address]   对照原片查照抄/旧名残留/台词量/说话人在场/非人角色被接话，到 WASH_PASS
+  chenyu-pro assets-export --dir <剧本目录> [--title 剧名]   导出全局资产清单（人物/形象/外观/场景/道具，.md + .json）
+  chenyu-pro deliver-check --dir <剧本目录> --source <分析稿目录>   交付门：机器指标+审核结论.json(剧情完整/对话称呼/剧情逻辑)，列出下一轮要做的事，迭代到 DELIVERY_PASS
 
   市场: ${Object.entries(MARKETS).map(([k, v]) => k + '=' + v).join(' ')}
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 try {
   await (commands[cmd] || cmdHelp)();
 } catch (err) {
