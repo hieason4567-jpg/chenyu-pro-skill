@@ -82,6 +82,8 @@ export const GENERIC_ALIAS_RE = /^(少女|女子|女孩|姑娘|男子|男人|女
 // 「特征 + 男子/少女……」这种外观描述（轮椅男子、灰西装男子、白背心男子、苗疆少女）也不是别名
 export const DESCRIPTOR_ALIAS_RE = /^[一-龥A-Za-z0-9]{1,8}(男子|女子|少女|少年|男人|女人|青年|老人|老者|长者|老头|妇人|中年人|男孩|女孩)$/;
 const isDescriptorAlias = (alias) => GENERIC_ALIAS_RE.test(alias) || DESCRIPTOR_ALIAS_RE.test(alias);
+// 头衔（X家少爷/董事长/X总）和物种/形态叫法（飞蛾/螳螂/黄鸭/蟾蜍）：可以作别名，但在描述文字里是普通词，不做全文替换
+export const DESCRIPTIVE_ALIAS_RE = /(少爷|小姐|少主|家主|千金|董事长|董事|总裁|老板|先生|夫人|太太|老爷|婆婆|奶奶|爷爷|大人|主人|寨主|谷主|蛾|螳螂|蟾蜍|蟾|蛤蟆|蚕|鸭|鹅|鸵鸟|蛇|狐|猫|狗|犬|兔|雀|鸟|虫|蛙|龟|鼠|狼|熊|驴|马|蝶|蜂|蛛|形态|造型)$/;
 
 // 身份泛称：只说身份不说是谁的称呼（刺客、保镖、手下……），前面可以带颜色/衣着/所属
 export const GENERIC_ROLE_RE = /^[一-龥]{0,6}(刺客|杀手|保镖|保安|手下|打手|随从|下属|助手|助理|员工|工人|职员|记者|护士|司机|服务员|警察|侍卫|家丁|丫鬟|仆人|混混|路人|群众|宾客)(首领|头目|头领|甲|乙|丙|丁)?$/;
@@ -136,7 +138,21 @@ const VOCATIVE_RE = /^[「“"]?([一-龥]{1,4})[，,！!、。…]/;
 const EMPTY_CELL = /^(none|无|n\/a|-)?$/i;
 const isEmpty = (value) => EMPTY_CELL.test(String(value ?? '').trim());
 const splitCells = (line) => line.trim().replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/).map((cell) => cell.trim());
-const splitPropList = (value) => String(value || '').split(/[、,，/;；]/)
+// 括号、引号里的分隔符不拆（「蓝色线装账本（内页写有：北辰医疗、实验维护）」是一件）
+const splitOutsideBrackets = (text) => {
+  const parts = [];
+  let depth = 0;
+  let current = '';
+  for (const ch of text) {
+    if ('（(【[「“'.includes(ch)) depth += 1;
+    else if ('）)】]」”'.includes(ch)) depth = Math.max(0, depth - 1);
+    if (!depth && /[、,，/;；]/.test(ch)) { parts.push(current); current = ''; continue; }
+    current += ch;
+  }
+  parts.push(current);
+  return parts;
+};
+const splitPropList = (value) => splitOutsideBrackets(String(value || ''))
   .map((item) => item.trim().replace(/[（(]\s*叠加\s*[）)]\s*$/, ''))
   .filter((item) => item && !isEmpty(item));
 // 场景用整格原文做写法（「豪门卧室/书房」「室内/手机屏幕」是一个写法，不拆开）
@@ -659,11 +675,14 @@ export function applyAssetMap(dossier, evidence, map, checked, { by = 'Agent', r
   const ambiguousInText = (from, to) => map.characters.some((c) => c.name !== to && [c.name, ...c.aliases].some((word) => word.includes(from)));
   // 名字写法统一（照月→黎照月、何少→贺景川）：标签改名 + 人物别名，都换成正式名。
   // 描述词（少女）、和别人名字重叠的（乌兰⊂乌兰婆）、单字的，不在描述文字里替换。
-  const renames = new Map([...target.entries()].filter(([from, to]) => !from.startsWith('OBS_') && from !== to && !ambiguousInText(from, to)));
+  const renames = new Map([...target.entries()].filter(([from, to]) => !from.startsWith('OBS_') && from !== to && !ambiguousInText(from, to) && !DESCRIPTIVE_ALIAS_RE.test(from) && !isDescriptorAlias(from)));
   const localNames = new Set(localRoles.keys());
   for (const c of map.characters) {
     for (const alias of ownAliases(c)) {
       if (alias.length < 2 || GENERIC_ALIAS_RE.test(alias) || renames.has(alias) || localNames.has(alias) || names.includes(alias)) continue;
+      // 头衔/物种/外貌式的别名（贺家少爷、董事长、飞蛾、螳螂、黄鸭、黑衣男子）在描述文字里是普通词，不替换：
+      // 否则「向贺家少爷贺景川退婚」→「向贺景川贺景川退婚」、「巨型黄鸭」→「巨型乌兰」（2026-10-01 实测）。说话人列、外观列仍按标签改。
+      if (DESCRIPTIVE_ALIAS_RE.test(alias) || DESCRIPTOR_ALIAS_RE.test(alias)) continue;
       if (ambiguousInText(alias, c.name) || [...target.entries()].some(([from, to]) => from === alias && to !== c.name)) continue;
       renames.set(alias, c.name);
     }
@@ -678,15 +697,26 @@ export function applyAssetMap(dossier, evidence, map, checked, { by = 'Agent', r
     const post = at >= 0 && to.slice(at + from.length) ? `(?!${escapeRegExp(to.slice(at + from.length))})` : '';
     return { re: new RegExp(pre + escapeRegExp(from) + post, 'g'), to };
   });
-  const rename = (text) => nameRules.reduce((acc, rule) => acc.replace(rule.re, rule.to), String(text));
+  // 换完去掉紧挨着的重复（「贺家少爷贺景川」这类原文换完会变成「贺景川贺景川」）
+  const dedupeNames = [...new Set([...renames.values()])].filter((name) => name.length >= 2);
+  const rename = (text) => dedupeNames.reduce((acc, name) => acc.split(name + name).join(name), nameRules.reduce((acc, rule) => acc.replace(rule.re, rule.to), String(text)));
   // 出场集：说话人、外观列之外，动作描述里写到了正式名（别名已统一成正式名）也算这一集出场。
   // 例：「灵蛾“某某”飞出撞倒刺客」这一行外观列没记它，出场集就漏了。长名字先匹配，短名字不在长名字里重复算。
-  const presenceNames = [...names].filter((name) => name.length >= 2).sort((a, b) => b.length - a.length);
+  // 只属于一个人的别名（婆婆、贺家少爷）写在动作描述里也算这个人出场——这些词不做全文替换，但出场要认
+  const aliasOwners = new Map();
+  for (const c of map.characters) for (const alias of ownAliases(c)) {
+    if (alias.length < 2 || GENERIC_ALIAS_RE.test(alias)) continue;
+    aliasOwners.set(alias, aliasOwners.has(alias) && aliasOwners.get(alias) !== c.name ? null : c.name);
+  }
+  const presenceWords = [
+    ...[...names].filter((name) => name.length >= 2).map((name) => [name, name]),
+    ...[...aliasOwners].filter(([alias, owner]) => owner && !names.includes(alias))
+  ].sort((a, b) => b[0].length - a[0].length);
   const mentionedIn = (text) => {
     let rest = String(text);
-    const found = [];
-    for (const name of presenceNames) if (rest.includes(name)) { found.push(name); rest = rest.split(name).join('\u0000'); }
-    return found;
+    const found = new Set();
+    for (const [word, owner] of presenceWords) if (rest.includes(word)) { found.add(owner); rest = rest.split(word).join('\u0000'); }
+    return [...found];
   };
   const overrides = new Map(map.lineOverrides.map((item) => [`${item.episode}\u0000${item.time}`, item.speaker]));
   const usedOverrides = new Set();

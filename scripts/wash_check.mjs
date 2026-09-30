@@ -29,12 +29,15 @@ export function similarity(a, b) {
 
 export function normalizeWashMap(raw = {}) {
   const renames = {};
+  const list = (v) => (Array.isArray(v) ? v.map((s) => String(s).trim()).filter(Boolean) : []);
+  // keep：分析稿人物表里有、但按用户要求不换名的（只改名模式下的设定词/物种名，如「母蛊」）；写成 源名=源名 也算 keep
+  const keep = new Set(list(raw.keep));
   for (const [from, to] of Object.entries(raw.renames || {})) {
     const f = String(from).trim(), t = String(to).trim();
     if (f && t && f !== t) renames[f] = t;
+    else if (f && f === t) keep.add(f);
   }
-  const list = (v) => (Array.isArray(v) ? v.map((s) => String(s).trim()).filter(Boolean) : []);
-  return { renames, creatures: list(raw.creatures), insiders: list(raw.insiders), dialogue: raw.dialogue === 'rewrite' ? 'rewrite' : 'keep' };
+  return { renames, keep: [...keep], creatures: list(raw.creatures), insiders: list(raw.insiders), dialogue: raw.dialogue === 'rewrite' ? 'rewrite' : 'keep' };
 }
 
 // 映射表自检：一个源名只能对应一个新名（JSON 天然保证）；两个源名不能换成同一个新名（除非是同一人的别写，允许但提示）；
@@ -89,12 +92,17 @@ export function parseScript(text) {
 }
 
 // 原片逐集台词。认两种格式：全剧合集（有「六、逐集分析表」）和平台反推稿 replay script（## EP001 分节的同款表格）。
+// 镜头数：按「、，/」切开后，含景别词（远景/全景/中景/近景/特写）的片段才算一个镜头；「中景，平视，固定」是一个镜头的三个属性
+const shotCount = (camera) => Math.max(1, String(camera || '').split(/[、,，/；;]/).filter((x) => /远景|全景|中景|近景|特写|大全景/.test(x)).length);
+
 export function sourceDialogueByEpisode(dossierText) {
   if (!String(dossierText || '').includes('## 六、逐集分析表')) return replayDialogueByEpisode(dossierText);
   const dossier = parseDossier(dossierText);
   const byEp = new Map();
+  const shots = new Map();
   for (const row of dossier.rows) {
     const n = Number(row.episode.replace(/\D/g, ''));
+    shots.set(n, (shots.get(n) || 0) + shotCount(row.cells[5]));
     const said = row.cells[1];
     if (isNone(said) || !/[一-龥]{2,}/.test(said)) continue;
     if (!byEp.has(n)) byEp.set(n, []);
@@ -106,23 +114,26 @@ export function sourceDialogueByEpisode(dossierText) {
     const cells = line.startsWith('|') ? line.split('|').map((s) => s.trim()) : [];
     if (cells.length > 3 && /^C\d+$/.test(cells[1])) names.push(cells[2]);
   }
-  return { byEp, characters: names.filter((n) => n.length >= 2) };
+  return { byEp, shots, characters: names.filter((n) => n.length >= 2) };
 }
 
 export function replayDialogueByEpisode(text) {
   const byEp = new Map();
+  const shots = new Map();
   let n = 0;
   for (const line of String(text || '').replace(/\r\n/g, '\n').split('\n')) {
     const head = line.match(/^#{1,4}\s*EP\s*0*(\d{1,4})\b/i);
     if (head) { n = Number(head[1]); continue; }
     if (!n || !/^\|\s*\d{1,2}:\d{2}/.test(line)) continue;
-    const said = line.split('|').map((s) => s.trim())[2];
+    const cells = line.split('|').map((s) => s.trim());
+    shots.set(n, (shots.get(n) || 0) + shotCount(cells[6]));
+    const said = cells[2];
     if (isNone(said) || !/[一-龥]{2,}/.test(said)) continue;
     if (!byEp.has(n)) byEp.set(n, []);
     byEp.get(n).push(said);
   }
   if (!byEp.size) throw new Error('原片台词表读不出来：既不是全剧合集，也不是按 EP 分节的反推稿');
-  return { byEp, characters: [] };
+  return { byEp, shots, characters: [] };
 }
 
 // 群体角色漏登：△/画面里写了「刺客们/保镖们/记者们」，本场「人物：」行却没有这个群体（客户端按人物行建角色卡，
@@ -187,14 +198,15 @@ export function washCheck({ episodes, dossierText, map }) {
   const keepMode = (map.dialogue || 'keep') !== 'rewrite';
   const missing = [];
   let retained = 0;
-  const { byEp, characters } = sourceDialogueByEpisode(dossierText);
+  const { byEp, shots, characters } = sourceDialogueByEpisode(dossierText);
   const errors = [], warnings = [], info = [];
   const renames = map.renames;
   const sourceNames = Object.keys(renames).filter((k) => k.length >= 2 || /[一-龥]/.test(k));
   // 能被对照表（含「X家」这类短规则）换掉的正式名就算有新名
   // 功能称呼（刺客首领/仓库主管/查账随从/山道鸵鸟）不是专名，不要求换名
   const isRole = (c) => GENERIC_ROLE_RE.test(c) || DESCRIPTOR_ALIAS_RE.test(c) || /(首领|头目|主管|管理员|随从|工人|下属|律师|医生|老者|老人|男子|女子|青年|鸵鸟|黄鸭|大鹅|实验体)/.test(c);
-  const unmapped = characters.filter((c) => !applyRenames(c, renames).count && !isRole(c));
+  const kept = new Set(map.keep || []);
+  const unmapped = characters.filter((c) => !applyRenames(c, renames).count && !isRole(c) && !kept.has(c));
   const creatures = new Set(map.creatures), insiders = new Set([...map.insiders, ...map.creatures]);
   const years = new Map();
   let totalLines = 0, copied = 0, srcTotal = 0, nearCopied = 0;
@@ -204,7 +216,11 @@ export function washCheck({ episodes, dossierText, map }) {
     const { lines, dialogue } = parseScript(text);
     const src = (byEp.get(n) || []).map((s) => applyRenames(s, renames).text);
     srcTotal += src.length; totalLines += dialogue.length;
-    perEpisode.push({ n, lines: dialogue.length, source: src.length });
+    const actions = lines.filter((l) => /^\s*(△|（画面)/.test(l)).length;
+    const shotN = shots?.get(n) || 0;
+    perEpisode.push({ n, lines: dialogue.length, source: src.length, actions, shots: shotN });
+    // 动作密度：原片镜头栏列了几个镜头，剧本至少要有九成动作行（一个镜头一拍；打斗、快切、走位不能一句带过）
+    if (shotN && actions < Math.ceil(shotN * 0.9)) warnings.push(`第${String(n).padStart(3, '0')}集 动作行 ${actions} 行，原片镜头 ${shotN} 个——按分析表「镜头」栏一个镜头至少写一行 △，打斗拆成出手/命中/反应，过渡走位写出来`);
     // 1 旧名残留（映射表里的源名 + 分析稿人物表里没映射的正式名）
     lines.forEach((l, i) => {
       for (const s of sourceNames) if (l.includes(s) && !Object.values(renames).some((t) => t.includes(s) && l.includes(t))) errors.push(`${tag(n, i + 1)} 残留源名「${s}」→ 应为「${renames[s]}」`);

@@ -10,9 +10,10 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 import { DOSSIER_FILE, applyAssetMap, checkAssetMap, collectAssetEvidence, normalizeAssetMap, parseDossier, renderEvidenceFiles } from './asset_workbook.mjs';
 import { WASH_MAP_FILE, addressTable, applyRenames, checkWashMap, normalizeWashMap, washCheck } from './wash_check.mjs';
 import { REVIEW_FILE, THRESHOLDS, deliverCheck } from './deliver_check.mjs';
-import { assetListJson, collectAssets, propNameIssues, renderAssetList } from './asset_export.mjs';
+import { assetListJson, collectAssets, lookTableIssues, lookTableJson, propNameIssues, renderAssetList } from './asset_export.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.11.0 2026-10-01  视频分析一镜一行（平台检测切点）；形象按剧情事件建、导出 形象表.json 供客户端上传；洗稿映射 keep（设定词不换名）；括号内道具名不拆、物种叫法不当人名。
 // v2.10.0 2026-09-30  洗稿质量闭环：写→查→审→修→复查，达到交付标准才算写完，不交半成品。
 //                    洗稿默认保留原台词（原片爆款台词只换名换设定词，改动逐句登记理由）；降重/出海才整句换说法(dialogue=rewrite)。
 //                    新增 rename（按 洗稿映射.json 一字不差换名）、wash-check（对照原片查原台词保留率/照抄[rewrite]/旧名残留/台词量/
@@ -127,7 +128,7 @@ import { assetListJson, collectAssets, propNameIssues, renderAssetList } from '.
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.10.0';
+const VERSION = '2.11.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -1418,7 +1419,8 @@ function cmdRename() {
 function cmdWashCheck() {
   const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro wash-check --dir <剧本目录> --source <分析稿目录> [--map 洗稿映射.json]'));
   const srcDir = path.resolve(arg('source', '') || die('缺 --source <分析稿目录>（video-analyze/video-fetch 取回的目录，写作用的整理版目录也可以）'));
-  const dossierFile = path.join(srcDir, DOSSIER_FILE);
+  // --source 给目录或直接给合集文件都行
+  const dossierFile = fs.existsSync(srcDir) && fs.statSync(srcDir).isFile() ? srcDir : path.join(srcDir, DOSSIER_FILE);
   if (!fs.existsSync(dossierFile)) die(`分析稿目录里没有 ${DOSSIER_FILE}: ${srcDir}`);
   const map = readWashMapOrDie(washMapPath(dir));
   const mapCheck = checkWashMap(map);
@@ -1446,7 +1448,8 @@ function cmdWashCheck() {
 function cmdDeliverCheck() {
   const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro deliver-check --dir <剧本目录> --source <分析稿目录> [--map 洗稿映射.json] [--review 审核结论.json]'));
   const srcDir = path.resolve(arg('source', '') || die('缺 --source <分析稿目录>'));
-  const dossierFile = path.join(srcDir, DOSSIER_FILE);
+  // --source 给目录或直接给合集文件都行
+  const dossierFile = fs.existsSync(srcDir) && fs.statSync(srcDir).isFile() ? srcDir : path.join(srcDir, DOSSIER_FILE);
   if (!fs.existsSync(dossierFile)) die(`分析稿目录里没有 ${DOSSIER_FILE}: ${srcDir}`);
   const map = readWashMapOrDie(washMapPath(dir));
   const reviewFile = path.resolve(arg('review', fs.existsSync(path.join(dir, REVIEW_FILE)) ? path.join(dir, REVIEW_FILE) : path.join(dir, '..', REVIEW_FILE)));
@@ -1499,6 +1502,11 @@ function cmdAssetsExport() {
   fs.writeFileSync(out.replace(/\.md$/, '.json'), JSON.stringify(assetListJson(assets), null, 1), 'utf8');
   const noLook = [...assets.people.values()].reduce((s, p) => s + [...p.looks.values()].filter((l) => !l.appearance).length, 0);
   console.log(`✓ 全局资产清单 -> ${out}（同名 .json 供程序读取）`);
+  const lookTable = lookTableJson(assets, { title: arg('title', '') });
+  const lookFile = path.join(path.dirname(out), '形象表.json');
+  fs.writeFileSync(lookFile, JSON.stringify(lookTable, null, 1), 'utf8');
+  console.log(`✓ 形象表 -> ${lookFile}（客户端「人物设定与故事背景」上传它：按表建形象卡、按场绑定标签）`);
+  for (const x of lookTableIssues(lookTable).slice(0, 20)) console.log('  ⚠ ' + x);
   const pn = propNameIssues(assets);
   for (const x of pn.slice(0, 40)) console.log('  ⚠ ' + x);
   if (pn.length > 40) console.log(`  … 另有 ${pn.length - 40} 处`);

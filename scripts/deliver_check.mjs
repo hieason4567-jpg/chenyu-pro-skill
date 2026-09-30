@@ -101,7 +101,7 @@ export function deliverCheck({ episodes, dossierText, map, review, gateErrors = 
     }
   }
   for (const w of wc.warnings) {
-    if (/说话但不在本场|刚说完话|没进本场「人物：」行/.test(w) && !isWaived(w)) todo.push(`${w}（改掉，或确认没问题后在审核结论 waivers 里登记 "${w.split(' ')[0]}"）`);
+    if (/说话但不在本场|刚说完话|没进本场「人物：」行|动作行 \d+ 行，原片镜头/.test(w) && !isWaived(w)) todo.push(`${w}（改掉，或确认没问题后在审核结论 waivers 里登记 "${w.split(' ')[0]}"）`);
   }
 
   // ---- 二、剧情完整：原片主要事件逐条落位 ----
@@ -185,9 +185,9 @@ export function deliverCheck({ episodes, dossierText, map, review, gateErrors = 
 
   // ---- 四、剧情逻辑 ----
   const issues = r.issues || [];
-  const openUnderstanding = issues.filter((i) => /理解/.test(i.level || '') && !/已改|已定|已处理|已解决|已修|不改/.test(i.status || ''));
+  const openUnderstanding = issues.filter((i) => /理解/.test(i.level || '') && !/已改|已定|已处理|已解决|已修|不改|无需改|无需处理|只读/.test(i.status || ''));
   for (const i of openUnderstanding) todo.push(`逻辑（影响理解）未解决：${i.where || ''} ${i.desc || ''}——必须改掉`);
-  for (const i of issues.filter((x) => /观感/.test(x.level || '') && !/已改|已定|已处理|已解决|已修|不改/.test(x.status || '') && !x.reason)) todo.push(`逻辑（影响观感）：${i.where || ''} ${i.desc || ''}——改掉或写不改的理由`);
+  for (const i of issues.filter((x) => /观感/.test(x.level || '') && !/已改|已定|已处理|已解决|已修|不改|无需改|无需处理|只读/.test(x.status || '') && !x.reason)) todo.push(`逻辑（影响观感）：${i.where || ''} ${i.desc || ''}——改掉或写不改的理由`);
   if (!(r.timeline || []).length) todo.push('逻辑：审核结论缺 timeline（统一时间线：每个"X 年前/当年"事件一行，并核对正文台词口径一致）');
   if (!(r.knowledge || []).length) todo.push('逻辑：审核结论缺 knowledge（谁知道什么：每个秘密谁在第几集、怎么知道的）');
   const fs = r.foreshadow || [];

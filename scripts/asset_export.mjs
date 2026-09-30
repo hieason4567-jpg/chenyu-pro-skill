@@ -18,6 +18,8 @@ const splitList = (s) => String(s || '').replace(/[（(][^）)]*[）)]/g, (m) =>
 export function collectAssets(episodes, { looks = [], creatures = [] } = {}) {
   const people = new Map(); // 名 -> { eps:Set, lines, looks: Map(变体 -> { eps:Set, appearance }) }
   const scenes = new Map(); // 场景名 -> { eps:Set, times:Set }
+  const casting = new Map(); // 集 -> Map(场次号 -> { 角色: 变体 })，客户端按场绑定 [角色-变体名]
+  let sceneNo = '';
   const props = new Map(); // 道具名 -> { eps:Set, owners:Set, states:Set, counts:Set }
   const person = (name) => { if (!people.has(name)) people.set(name, { eps: new Set(), lines: 0, looks: new Map() }); return people.get(name); };
   const lookText = new Map(looks.map((x) => [`${String(x.role || '').trim()}=${String(x.variant || '').trim()}`, String(x.appearance || '')]));
@@ -26,6 +28,7 @@ export function collectAssets(episodes, { looks = [], creatures = [] } = {}) {
       const l = raw.trim();
       const head = l.match(/^\d+\s*[-–—]\s*\d+\s+(日|夜|晨|昏|黄昏|清晨|傍晚|白天|夜晚)?\s*(内|外|室内|室外)?\s*(.+)$/);
       if (head && /^\d+-\d+\s/.test(l)) {
+        sceneNo = l.match(/^(\d+-\d+)/)[1];
         const name = head[3].trim();
         if (!scenes.has(name)) scenes.set(name, { eps: new Set(), times: new Set() });
         scenes.get(name).eps.add(n);
@@ -35,12 +38,20 @@ export function collectAssets(episodes, { looks = [], creatures = [] } = {}) {
       if (/^人物[:：]/.test(l)) { for (const p of splitList(l.slice(3))) person(p).eps.add(n); continue; }
       if (l.startsWith('【形象】')) {
         for (const kv of l.slice(4).split(/[；;]/)) {
-          const m = kv.match(/^\s*([^=＝]+)[=＝]\s*([^（(]+)/);
+          const m = kv.match(/^\s*([^=＝]+)[=＝]\s*([^（(]+)(?:[（(]([^）)]*)[）)])?/);
           if (!m) continue;
           const who = m[1].trim(), v = m[2].trim();
           const p = person(who); p.eps.add(n);
-          if (!p.looks.has(v)) p.looks.set(v, { eps: new Set(), appearance: lookText.get(`${who}=${v}`) || '' });
-          p.looks.get(v).eps.add(n);
+          if (!p.looks.has(v)) p.looks.set(v, { eps: new Set(), scenes: 0, reason: '', appearance: lookText.get(`${who}=${v}`) || '' });
+          const lk = p.looks.get(v);
+          lk.eps.add(n); lk.scenes++;
+          if (!lk.reason && m[3]) lk.reason = m[3].trim();
+          if (sceneNo) {
+            if (!casting.has(n)) casting.set(n, new Map());
+            const byScene = casting.get(n);
+            if (!byScene.has(sceneNo)) byScene.set(sceneNo, {});
+            byScene.get(sceneNo)[who] = v;
+          }
         }
         continue;
       }
@@ -64,7 +75,7 @@ export function collectAssets(episodes, { looks = [], creatures = [] } = {}) {
     }
   }
   const creatureSet = new Set(creatures);
-  return { people, scenes, props, creatureSet };
+  return { people, scenes, props, creatureSet, casting };
 }
 
 export function renderAssetList({ people, scenes, props, creatureSet }, { title = '' } = {}) {
@@ -107,4 +118,38 @@ export function assetListJson({ people, scenes, props, creatureSet }) {
     props: [...props.entries()].map(([name, pr]) => ({ name, owners: [...pr.owners], states: [...pr.states], counts: [...pr.counts], episodes: [...pr.eps].sort((a, b) => a - b) }))
   };
 }
+const GROUP_RE = /数人|若干|\d+名|[二两三四五六七八九十]名|们$/;
+const CREATURE_RE = /蛊|虫|蛾|蟾|蛙|螳螂|蜂|蛛|蝶|鸭|鹅|鸵鸟|鸟|兽|蛇|狐|猫|狗|犬|兔|龟|鼠|狼|熊/;
+const HUMAN_LOOK_RE = /男|女|老人|老者|孩|西装|衬衫|外套|大衣|长袍|裙|裤|头发|盘发|短发|长发|辫/;
+
+// 形象表（给客户端「上传形象表」用）：有这张表时客户端按表建角色形象卡、按场绑定 [角色-变体名]，不再让 AI 猜变体。
+// main = 场次最多的那个形象；reason 取【形象】括号里第一次写的原因（伪装/回忆/受伤…）；scenes 按 集 -> 场次号 -> 角色=变体。
+export function lookTableJson({ people, creatureSet, casting }, { title = '' } = {}) {
+  const characters = [];
+  for (const [name, p] of people) {
+    const looks = [...p.looks.entries()];
+    if (!looks.length) continue;
+    const main = looks.reduce((a, b) => (b[1].scenes > a[1].scenes ? b : a))[0];
+    characters.push({
+      name,
+      kind: creatureSet.has(name) || CREATURE_RE.test(name + (p.looks.get(main)?.appearance || '')) && !HUMAN_LOOK_RE.test(p.looks.get(main)?.appearance || '') ? 'creature' : GROUP_RE.test(name) ? 'group' : 'human',
+      episodes: span(p.eps),
+      looks: looks.map(([variant, lk]) => ({ variant, tag: `[${name}-${variant}]`, main: variant === main, reason: variant === main ? '' : lk.reason, appearance: lk.appearance, episodes: span(lk.eps) }))
+    });
+  }
+  const scenes = {};
+  for (const [n, byScene] of [...casting.entries()].sort((a, b) => a[0] - b[0])) scenes[n] = Object.fromEntries(byScene);
+  return { schema: 'chenyu.look-table/v1', title, characters, scenes };
+}
+
+// 形象表体检：没写外观的形象、非主形象没写原因
+export function lookTableIssues(table) {
+  const issues = [];
+  for (const c of table.characters) for (const l of c.looks) {
+    if (!l.appearance) issues.push(`${l.tag} 没写外观（审核结论 looks 补 appearance：年龄段、发型、样貌、服装）`);
+    if (!l.main && !l.reason) issues.push(`${l.tag} 不是主形象但没写因何而变（【形象】括号里写剧情原因：伪装/回忆/受伤/变身…；没有剧情原因的日常换装并入主形象）`);
+  }
+  return issues;
+}
+
 export { epTag };
