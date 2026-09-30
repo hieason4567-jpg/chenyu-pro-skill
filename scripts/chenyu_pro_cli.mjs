@@ -11,8 +11,10 @@ import { DOSSIER_FILE, applyAssetMap, checkAssetMap, collectAssetEvidence, norma
 import { WASH_MAP_FILE, addressTable, applyRenames, checkWashMap, normalizeWashMap, washCheck } from './wash_check.mjs';
 import { REVIEW_FILE, THRESHOLDS, deliverCheck } from './deliver_check.mjs';
 import { assetListJson, collectAssets, lookTableIssues, lookTableJson, propNameIssues, renderAssetList } from './asset_export.mjs';
+import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// v2.12.0 2026-10-01  形象变体名改为身份/事件（和客户端建卡规则一致）；新命令 durations 按原片写【原片时长】【本场时长】（客户端转分镜不再压短）；补写说话人待核、道具归属抽帧核对、keep 用法。
 // v2.11.0 2026-10-01  视频分析一镜一行（平台检测切点）；形象按剧情事件建、导出 形象表.json 供客户端上传；洗稿映射 keep（设定词不换名）；括号内道具名不拆、物种叫法不当人名。
 // v2.10.0 2026-09-30  洗稿质量闭环：写→查→审→修→复查，达到交付标准才算写完，不交半成品。
 //                    洗稿默认保留原台词（原片爆款台词只换名换设定词，改动逐句登记理由）；降重/出海才整句换说法(dialogue=rewrite)。
@@ -128,7 +130,7 @@ import { assetListJson, collectAssets, lookTableIssues, lookTableJson, propNameI
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.11.0';
+const VERSION = '2.12.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -1486,6 +1488,40 @@ function cmdDeliverCheck() {
 }
 
 // assets-export：全局资产清单（人物/形象/场景/道具），随稿交付给下游建角色卡、场景图、道具图。
+// 原片时长标注：集标题下写【原片时长】、每场写【本场时长】，客户端转分镜按原片节奏分配时长（不写会被压短三成）
+function cmdDurations() {
+  const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro durations --dir <剧本目录> --source <分析稿目录或合集文件> [--dry-run]'));
+  const srcArg = path.resolve(arg('source', '') || die('缺 --source <分析稿目录>（video-analyze/video-fetch 取回的目录或整理版目录）'));
+  const dossierFile = fs.existsSync(srcArg) && fs.statSync(srcArg).isFile() ? srcArg : path.join(srcArg, DOSSIER_FILE);
+  if (!fs.existsSync(dossierFile)) die(`分析稿目录里没有 ${DOSSIER_FILE}: ${srcArg}`);
+  const files = listScriptFiles(dir).filter((f) => episodeNoOfFile(path.basename(f)) > 0);
+  if (!files.length) die('目录里没有文件名带「第N集」的剧本');
+  let renames = {};
+  const mapFile = washMapPath(dir);
+  if (fs.existsSync(mapFile)) renames = readWashMapOrDie(mapFile).renames;
+  const episodes = files.map((f) => ({ file: f, n: episodeNoOfFile(path.basename(f)), text: fs.readFileSync(f, 'utf8') }));
+  const results = annotateDurations(episodes, fs.readFileSync(dossierFile, 'utf8'), renames);
+  const dry = flag('dry-run');
+  let missing = 0;
+  results.forEach((r, i) => {
+    if (!r.total) { missing += 1; console.log(`  ⚠ 第${r.n}集 分析稿里没有这一集的时长，跳过`); return; }
+    console.log(`  第${String(r.n).padStart(3, '0')}集 原片 ${r.total.toFixed(1)} 秒：${r.scenes.map((s) => `${s.head.split(/\s+/)[0]} ${s.seconds}s`).join('、')}`);
+    if (!dry) fs.writeFileSync(episodes[i].file, r.text, 'utf8');
+  });
+  // 插了行，按行号登记的 waivers 跟着挪（审核结论.json 在剧本目录或上一级）
+  for (const cand of [path.join(dir, REVIEW_FILE), path.join(dir, '..', REVIEW_FILE)]) {
+    if (!fs.existsSync(cand)) continue;
+    try {
+      const review = JSON.parse(fs.readFileSync(cand, 'utf8').replace(/^﻿/, ''));
+      const moved = shiftWaivers(review, results);
+      if (moved && !dry) fs.writeFileSync(cand, JSON.stringify(review, null, 1), 'utf8');
+      if (moved) console.log(`  审核结论 waivers 行号跟着挪了 ${moved} 条${dry ? '（试运行未写）' : ''}`);
+    } catch (e) { console.log(`  ⚠ 审核结论读不了，waivers 行号没挪：${e.message}`); }
+    break;
+  }
+  console.log(`${dry ? '（试运行，未写盘）' : '✓ 已写入'} ${results.length - missing} 集的【原片时长】和【本场时长】。改完跑 gate --dir 确认格式。`);
+}
+
 function cmdAssetsExport() {
   const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro assets-export --dir <剧本目录> [--out 全局资产清单.md] [--title 剧名]'));
   const episodes = listScriptFiles(dir).map((f) => ({ n: episodeNoOfFile(path.basename(f)), text: fs.readFileSync(f, 'utf8') })).filter((e) => e.n > 0);
@@ -1552,14 +1588,15 @@ function cmdHelp() {
   【洗稿——纯本地、零积分】
   chenyu-pro rename --dir <剧本目录> [--map 洗稿映射.json] [--dry-run]   按名字对照表一字不差换名
   chenyu-pro wash-check --dir <剧本目录> --source <分析稿目录> [--address]   对照原片查照抄/旧名残留/台词量/说话人在场/非人角色被接话，到 WASH_PASS
-  chenyu-pro assets-export --dir <剧本目录> [--title 剧名]   导出全局资产清单（人物/形象/外观/场景/道具，.md + .json）
+  chenyu-pro assets-export --dir <剧本目录> [--title 剧名]   导出全局资产清单（人物/形象/外观/场景/道具，.md + .json）+ 形象表.json
+  chenyu-pro durations --dir <剧本目录> --source <分析稿目录> [--dry-run]   按原片写【原片时长】【本场时长】（视频还原/洗稿必跑）
   chenyu-pro deliver-check --dir <剧本目录> --source <分析稿目录>   交付门：机器指标+审核结论.json(剧情完整/对话称呼/剧情逻辑)，列出下一轮要做的事，迭代到 DELIVERY_PASS
 
   市场: ${Object.entries(MARKETS).map(([k, v]) => k + '=' + v).join(' ')}
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 try {
   await (commands[cmd] || cmdHelp)();
 } catch (err) {

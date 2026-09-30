@@ -3,7 +3,7 @@
 # 装到 Codex + Claude Code 的 skills 目录，并创建全局 chenyu-pro 命令。需 Node 18+。
 $ErrorActionPreference = "Stop"
 $repo = "https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main"
-$files = @("SKILL.md", "scripts/chenyu_pro_cli.mjs", "scripts/asset_workbook.mjs", "scripts/wash_check.mjs", "scripts/deliver_check.mjs", "scripts/asset_export.mjs")
+$files = @("SKILL.md", "scripts/chenyu_pro_cli.mjs", "scripts/asset_workbook.mjs", "scripts/wash_check.mjs", "scripts/deliver_check.mjs", "scripts/asset_export.mjs", "scripts/durations.mjs")
 
 $roots = @()
 $roots += Join-Path $env:USERPROFILE ".codex\skills"
