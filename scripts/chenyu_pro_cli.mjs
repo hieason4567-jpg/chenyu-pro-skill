@@ -3,14 +3,16 @@
 // 不消耗平台积分；本 CLI 只做 鉴权/项目壳/正文回传/只读查询/交付。
 // CLI 内不存在任何能触发平台模型生成或扣积分的调用（v2.1.0 起物理移除）。
 // 零依赖，Node 18+。配置存 ~/.codex/chenyu-pro/config.json（KEY/session 掩码显示，绝不写入日志）。
+import './net.mjs'; // 网络层：直连失败自动改走系统代理（须在其它代码之前加载，先取到代理环境变量）
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { exec, spawn, spawnSync } from 'node:child_process';
 import { DOSSIER_FILE, applyAssetMap, checkAssetMap, collectAssetEvidence, normalizeAssetMap, parseDossier, renderEvidenceFiles } from './asset_workbook.mjs';
 import { WASH_MAP_FILE, addressTable, applyRenames, checkWashMap, normalizeWashMap, washCheck } from './wash_check.mjs';
 import { REVIEW_FILE, THRESHOLDS, deliverCheck } from './deliver_check.mjs';
-import { assetListJson, collectAssets, lookTableIssues, lookTableJson, propNameIssues, renderAssetList } from './asset_export.mjs';
+import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets, lookStylingTemplate, lookTableIssues, lookTableJson, mergeLookStylings, mergePlacePropDesigns, placePropTemplate, propNameIssues, renderAssetList } from './asset_export.mjs';
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
@@ -130,7 +132,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.12.0';
+const VERSION = '2.13.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -176,7 +178,19 @@ const MARKETS = {
 };
 
 const args = process.argv.slice(2);
-const cmd = args[0] || 'help';
+// 免费版（chenyu-gate）用同一份程序：只开放不需要 KEY 的本地命令，输出里的命令名换成 chenyu-gate
+const EDITION = process.env.CHENYU_EDITION === 'gate' ? 'gate' : 'pro';
+// 免费版老用法「chenyu-gate --file 剧本.txt / --dir 目录」= 格式门
+const cmd = EDITION === 'gate' && /^--(file|dir)$/.test(args[0] || '') ? 'gate' : (args[0] || 'help');
+const GATE_COMMANDS = new Set(['gate', 'variants', 'inspect', 'wash-check', 'deliver-check', 'rename', 'assets-prepare', 'assets-apply', 'assets-export', 'durations',
+  'remake-prepare', 'remake-units', 'remake-lint', 'remake-review', 'remake-apply', 'guide', 'help', 'version', '--version', '-v']);
+const CLI_NAME = EDITION === 'gate' ? 'chenyu-gate' : 'chenyu-pro';
+if (EDITION === 'gate') {
+  for (const k of ['log', 'error']) {
+    const raw = console[k].bind(console);
+    console[k] = (...a) => raw(...a.map((x) => (typeof x === 'string' ? x.replace(/chenyu-pro(?![-_\w])/g, 'chenyu-gate') : x)));
+  }
+}
 const arg = (name, fallback = '') => {
   const i = args.indexOf('--' + name);
   return i >= 0 && args[i + 1] !== undefined ? args[i + 1] : fallback;
@@ -1522,7 +1536,218 @@ function cmdDurations() {
   console.log(`${dry ? '（试运行，未写盘）' : '✓ 已写入'} ${results.length - missing} 集的【原片时长】和【本场时长】。改完跑 gate --dir 确认格式。`);
 }
 
-function cmdAssetsExport() {
+const LOOK_DESIGN_FILE = '形象设计.json';
+const LOOK_KIT_DIR = '形象设计资料';
+const STYLING_STATIC = path.join(path.dirname(fileURLToPath(import.meta.url)), 'styling_static.json');
+
+// 造型资料：知识库两条提示词 + 全量形象库，用积分 KEY 实时取（和客户端造型 AI 收到的是同一份）
+async function fetchStylingKit(kitDir) {
+  const cfg = loadConfig();
+  const key = String(cfg.credit_key || '').trim();
+  if (!key) die('未绑定积分 KEY——先运行: chenyu-pro key set <你的KEY>（形象设计要用它取知识库造型提示词）');
+  const base = String(cfg.credit_base || DEFAULT_CREDIT_BASE).replace(/\/$/, '');
+  const headers = { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json', 'User-Agent': CLI_UA };
+  const token = (id) => `␞PMPT:${id}␞`;
+  const r1 = await fetch(base + '/api/v1/prompt-registry/resolve', { method: 'POST', headers, body: JSON.stringify({ texts: [token('styling.core_rules'), token('styling.voice_preset_guide'), token('asset.global_table.system')] }) });
+  const j1 = await r1.json().catch(() => ({}));
+  if (!r1.ok || !j1.success || !Array.isArray(j1.texts)) die(`取知识库造型提示词失败：HTTP ${r1.status} ${j1.error || ''}`);
+  const clean = (s) => String(s || '').replace(/␞/g, '').trim();
+  const r2 = await fetch(base + '/api/v1/character-styling-catalog', { headers });
+  const j2 = await r2.json().catch(() => ({}));
+  const capsules = j2?.catalog?.wardrobeCapsules || j2?.wardrobeCapsules || [];
+  if (!r2.ok || !capsules.length) die(`取形象库失败：HTTP ${r2.status} ${j2.error || ''}`);
+  fs.mkdirSync(kitDir, { recursive: true });
+  const kit = { coreRules: clean(j1.texts[0]), voicePresetGuide: clean(j1.texts[1]), assetTableRules: clean(j1.texts[2]), capsules, fetchedAt: new Date().toISOString() };
+  fs.writeFileSync(path.join(kitDir, 'kit.json'), JSON.stringify(kit), 'utf8');
+  return kit;
+}
+
+const expandEpisodeSpan = (span) => new Set(String(span || '').split(/[、,]/).flatMap((p) => {
+  const m = p.trim().match(/^(\d+)(?:[–-](\d+))?$/);
+  if (!m) return [];
+  const a = Number(m[1]), b = Number(m[2] || m[1]);
+  return Array.from({ length: Math.min(b - a + 1, 200) }, (_, i) => a + i);
+}));
+
+// 每个形象给 Agent 的角色信息：原片外观锚点（审核结论/分析稿）、状态、出现集、剧本里写到他的动作行和台词（判断身份、气质、声线）
+function buildLookInputs(table, episodes, looks) {
+  const lookText = new Map((looks || []).map((x) => [`${String(x.role || '').trim()}=${String(x.variant || '').trim()}`, x]));
+  const inputs = new Map();
+  for (const c of table.characters) for (const l of c.looks) {
+    const lk = lookText.get(`${c.name}=${l.variant}`) || {};
+    const eps = expandEpisodeSpan(l.episodes);
+    const actions = [], lines = [];
+    for (const ep of episodes) {
+      if (!eps.has(ep.n) || (actions.length >= 4 && lines.length >= 4)) continue;
+      for (const raw of String(ep.text).split('\n')) {
+        const s = raw.trim();
+        if (actions.length < 4 && s.startsWith('△') && s.includes(c.name)) actions.push(`第${ep.n}集 ${s.slice(0, 80)}`);
+        if (lines.length < 4 && s.startsWith(c.name + '：')) lines.push(`第${ep.n}集 ${s.slice(0, 60)}`);
+      }
+    }
+    inputs.set(`${c.name}=${l.variant}`, {
+      characterName: `[${c.name}-${l.variant}]`, kind: c.kind, stateLabel: l.variant, stateReason: l.reason || '', isPrimaryState: l.main,
+      episodes: l.episodes, appearanceFeatures: lk.appearance || l.appearance || '', sourceActions: actions, sourceLines: lines,
+    });
+  }
+  return inputs;
+}
+
+// 场景/道具给 Agent 的资料：场景取环境行和前几行 △，道具取写到它的 △ 和【道具】括号里的归属/状态
+function buildPlacePropInputs(table, episodes) {
+  const inputs = new Map();
+  const placeSet = new Set((table.places || []).map((p) => p.name));
+  const placeText = new Map([...placeSet].map((n) => [n, { env: [], actions: [] }]));
+  for (const ep of episodes) {
+    let cur = null, afterHead = 0;
+    for (const raw of String(ep.text).split('\n')) {
+      const s = raw.trim();
+      if (!s) continue;
+      const head = s.match(/^\d+\s*[-–—]\s*\d+\s+(?:日|夜|晨|昏|黄昏|清晨|傍晚|白天|夜晚)?\s*(?:内|外|室内|室外)?\s*(.+)$/);
+      if (head && /^\d+-\d+\s/.test(s)) { cur = placeText.get(head[1].trim()) || null; afterHead = 0; continue; }
+      if (!cur || /^(人物|【)/.test(s)) continue;
+      afterHead++;
+      if (afterHead <= 2 && !s.startsWith('△') && !/^[^：:]{1,14}[：:]/.test(s) && cur.env.length < 4) cur.env.push(`第${ep.n}集 ${s.slice(0, 120)}`);
+      else if (s.startsWith('△') && cur.actions.length < 4) cur.actions.push(`第${ep.n}集 ${s.slice(0, 90)}`);
+    }
+  }
+  for (const p of table.places || []) {
+    const t = placeText.get(p.name) || { env: [], actions: [] };
+    inputs.set(`place=${p.name}`, { times: p.times, episodes: p.episodes, parentGuess: p.name.includes('·') ? p.name.split('·')[0] : '', environmentLines: t.env, sampleActions: t.actions });
+  }
+  for (const p of table.props || []) {
+    const eps = expandEpisodeSpan(p.episodes);
+    const mentions = [];
+    for (const ep of episodes) {
+      if (!eps.has(ep.n) || mentions.length >= 4) continue;
+      for (const raw of String(ep.text).split('\n')) {
+        const s = raw.trim();
+        if (mentions.length < 4 && s.startsWith('△') && s.includes(p.name)) mentions.push(`第${ep.n}集 ${s.slice(0, 90)}`);
+      }
+    }
+    inputs.set(`prop=${p.name}`, { owners: p.owners, counts: p.counts, states: p.states, episodes: p.episodes, episodeCount: eps.size, mentions });
+  }
+  return inputs;
+}
+
+// 场景道具设计任务书：规则取知识库 asset.global_table.system（客户端全局资产表同一份），只看其中道具与场景的部分
+function writePlacePropTask(kitDir, root, table, episodes, kit) {
+  const file = path.join(root, PLACE_PROP_DESIGN_FILE);
+  let existing = [];
+  if (fs.existsSync(file)) { try { existing = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, '')); } catch (e) { die(`${file} 不是合法 JSON：${e.message}`); } }
+  const tpl = placePropTemplate(table, existing, buildPlacePropInputs(table, episodes));
+  fs.writeFileSync(file, JSON.stringify(tpl, null, 1), 'utf8');
+  const task = [
+    '# 场景道具设计任务（和客户端全局资产表同一套规则，思考由你做）',
+    '',
+    `本剧场景 ${(table.places || []).length} 个、道具 ${(table.props || []).length} 件。逐条填写上一级 ${PLACE_PROP_DESIGN_FILE} 里每条的 design（input 是剧本里关于它的资料，只读），填完跑 \`chenyu-pro assets-export --dir <剧本目录>\` 检查，直到 ASSET_DESIGN_PASS。`,
+    '',
+    '## 一、规则（知识库 asset.global_table.system；这里只用其中「道具与场景」「通话设备」两部分，人物/形象部分由形象设计负责）',
+    kit.assetTableRules || '（kit.json 缺 assetTableRules：重跑 looks-prepare 取知识库）',
+    '',
+    '## 二、输出格式',
+    '场景：{"description":"80–180 个汉字的可搭建空间说明：布局、门窗墙地、固定家具、纵深；稀疏场景可做保守空间设计，不新增剧情实体","shortDescription":"4–18 字场景短标签","parentLocation":"所属物理地点（同一建筑/院落/机构/车辆填同一个名字，门口与室内同组但仍是不同场景）"}',
+    '道具：{"card":true 或 false,"reason":"不建卡时写原因","description":"建卡时 50–140 个汉字的实体外观说明：材质、颜色、形状、尺寸、磨损、独特标记","shortDescription":"建卡时 4–18 字道具短标签"}',
+    '',
+    '- 道具建卡：确有稳定外观、跨镜头/跨集要连续、或外观独特的才建（信物、证据原件、关键图纸、标志性随身物）；普通一次性纸张、单据、食物、屏幕内容不建卡（剧情照写，只是不出卡）。',
+    '- 例外：人物在剧本里实际拿起、拨打、接听、挂断的手机/电话等通话设备，必须建卡。',
+    '- 描述只写看得见的外观，按原剧本世界（年代、身份、贫富）设计；不写剧情、不写人物动作、不写“被打翻”这类状态（状态留在分镜里）。',
+    '- 同一物理地点的子场景（如「程家·客厅」「程家·书房」）风格统一：parentLocation 相同，描述里的建筑年代、装修风格、主色保持一致。',
+  ].join('\n');
+  fs.writeFileSync(path.join(kitDir, '场景道具设计任务.md'), task, 'utf8');
+  const todo = tpl.filter((e) => (e.type === 'place' ? !String(e.design?.description || '').trim() : e.design?.card !== true && e.design?.card !== false)).length;
+  console.log(`✓ 场景道具设计 -> ${file}：场景 ${(table.places || []).length} + 道具 ${(table.props || []).length}，待填 ${todo} 条（已填的保留）；任务书 ${path.join(kitDir, '场景道具设计任务.md')}`);
+}
+
+// 形象设计：走客户端造型 AI 的同一套固定流程（同样的知识库提示词、资料、输出格式），思考由 Agent 做
+async function cmdLooksPrepare() {
+  const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro looks-prepare --dir <剧本目录>'));
+  const episodes = listScriptFiles(dir).map((f) => ({ n: episodeNoOfFile(path.basename(f)), text: fs.readFileSync(f, 'utf8') })).filter((e) => e.n > 0);
+  if (!episodes.length) die('目录里没有文件名带「第N集」的剧本');
+  let looks = [], creatures = [];
+  for (const cand of [path.join(dir, REVIEW_FILE), path.join(dir, '..', REVIEW_FILE)]) {
+    if (fs.existsSync(cand)) { try { looks = JSON.parse(fs.readFileSync(cand, 'utf8').replace(/^﻿/, '')).looks || []; } catch {} break; }
+  }
+  const mapFile = washMapPath(dir);
+  if (fs.existsSync(mapFile)) { try { creatures = JSON.parse(fs.readFileSync(mapFile, 'utf8').replace(/^﻿/, '')).creatures || []; } catch {} }
+  const table = lookTableJson(collectAssets(episodes, { looks, creatures }));
+  const root = path.join(dir, '..');
+  const kitDir = path.join(root, LOOK_KIT_DIR);
+  const kit = await fetchStylingKit(kitDir);
+  const st = JSON.parse(fs.readFileSync(STYLING_STATIC, 'utf8'));
+  const file = path.resolve(arg('out', path.join(root, LOOK_DESIGN_FILE)));
+  let existing = [];
+  if (fs.existsSync(file)) { try { existing = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, '')); } catch (e) { die(`${file} 不是合法 JSON：${e.message}`); } }
+  if (!Array.isArray(existing) || existing.some((e) => e && e.design && !e.styling)) existing = []; // 旧版 design 字段格式不再沿用
+  const tpl = lookStylingTemplate(table, existing, buildLookInputs(table, episodes, looks));
+  fs.writeFileSync(file, JSON.stringify(tpl, null, 1), 'utf8');
+  const task = [
+    '# 形象设计任务（和客户端造型 AI 同一套固定流程，思考由你做）',
+    '',
+    `本剧 ${tpl.length} 个形象。做法：先通读全部形象的角色信息，整部剧一次规划配色、发型、脸型（主要角色之间主色/发型/脸型错开；同一角色各形象脸、身形、发型、发色一致，只按状态换装），`,
+    '再逐条按下面的「输出格式」填写同目录上一级 形象设计.json 里每条的 styling（input 是这个形象的角色信息，只读）。填完跑 `chenyu-pro assets-export --dir <剧本目录>` 检查，直到 STYLING_AUDIT_PASS（那是客户端原样的造型审核，不过就会被客户端打回重调模型扣分）。',
+    '',
+    '客户端审核最常打回的几处，动笔就避开：',
+    ...STYLING_AUDIT_HINTS.slice(0, 6).map(([, h]) => `- ${h}`),
+    '',
+    '## 一、造型核心规则（知识库 styling.core_rules）', kit.coreRules, '',
+    '## 二、音色库键名参考（知识库 styling.voice_preset_guide）', kit.voicePresetGuide, '',
+    '## 三、Doubao voice ID candidates (default TTS provider)', st.doubaoVoiceCandidateGuide, '', ...st.voiceContract, '',
+    '## 四、全量形象库索引（wardrobeCapsuleId 必须取这里的真实 id）', buildCatalogIndex(kit.capsules), '',
+    '## 五、原文审核规则（客户端每次造型都带）', ...st.auditRules.map((r) => '- ' + r), '',
+    '## 六、输出格式（每条 styling 一个对象，和造型 AI 单条返回一致）',
+    '{"classification":{"roleDomain":"身份领域","roleTags":["具体身份标签"]},"wardrobeCapsuleId":"形象库真实 id","description":"性别：…。年龄段：…。外观特征：…。脸部：…。身材：…。发型：…。服饰类型：…。发色：…。主色调：…。部件配色：…。视觉锚点：…。（≥120 中文字，按这个顺序）","voicePresetKey":"女-青年-明亮利落","voiceRefDescription":"≤4 个声学特点","ttsProvider":"Doubao","doubaoVoiceId":"候选里的确切 ID","doubaoVoiceModel":"' + st.doubaoDefaultModel + '","doubaoVoiceSpeed":1}',
+    '',
+    '- 同一角色的各形象用同一个 voicePresetKey 和 doubaoVoiceId（回忆里不同年龄段的形象除外：幼年/少年换对应年龄的音色，否则客户端音色审核会打回重做）；群体角色写成一群人的统一装束；非人角色按物种外形写，音色按它的说话方式选（不说话的选最贴近的并在 voiceRefDescription 写明「不说话」）。',
+    '- 外观以原片为准（input.appearanceFeatures 是原片外观锚点，不可改写）；AI 视频的颜色漂移取最常见的那个。',
+  ].join('\n');
+  fs.writeFileSync(path.join(kitDir, '形象设计任务.md'), task, 'utf8');
+  const todo = tpl.filter((e) => !String(e.styling?.description || '').trim()).length;
+  console.log(`✓ 形象设计任务 -> ${path.join(kitDir, '形象设计任务.md')}（知识库提示词 + 豆包音色 ${st.doubaoVoiceCandidateGuide.split('\n').length} 个 + 形象库 ${kit.capsules.length} 个 + 审核规则 ${st.auditRules.length} 条）`);
+  console.log(`✓ 形象设计 -> ${file}：${tpl.length} 个形象，待填 ${todo} 个（已填的保留）。填 styling 后跑 assets-export 检查并进形象表.json`);
+  writePlacePropTask(kitDir, root, table, episodes, kit);
+}
+
+// 客户端造型审核原样打包在 styling_audit.mjs（判定与客户端一致）：这里不通过的形象，上传后客户端会打回重调模型（扣用户积分）
+const STYLING_AUDIT_HINTS = [
+  [/未写完的段/, '段落不能以「和 与 及 为 呈 穿 套 披 系 戴 配 搭 、 ，」结尾（「手套」「头套」「内搭」也算），把这类词挪到段中间或换说法'],
+  [/voice-id-profile-age-conflict|voice-id-age-conflict|voice-age-conflict/, '音色 ID 的年龄档和描述「年龄段」的数字没有交集（儿童0-12/少年12-18/青年18-39/中年35-60/老年55-120/成人18-60）；候选里没有老年女声，老年女性把年龄段下限写到 60（如「60-75岁」）配中年/成人女声'],
+  [/gender-conflict/, '音色（预设/ID/说明）的性别和描述「性别」不一致'],
+  [/unusable AI voice preset:\s*$/, 'voiceRefDescription 要以「青年男声 / 中年女声」这类 年龄+性别+声 开头，最多 4 个声学特征'],
+  [/story-fit-missing:law-role/, '原文是警察/律师/法官，描述里要写出身份词（律师、警察、执法、制服等）'],
+  [/story-fit-missing:service-role/, '原文是管家/佣人/厨师，描述里要写出身份词（管家、佣人、厨师、围裙等）'],
+  [/story-fit-missing:/, '原文身份没有在描述里体现，写出身份词'],
+  [/catalog text copied|description gender/, '描述照抄了形象库文字，或描述性别和原文性别不一致'],
+  [/unknown exact catalog ID/, 'wardrobeCapsuleId 不在形象库里（先跑 looks-prepare 取云端形象库）'],
+  [/classification missing/, '缺 classification（roleDomain/roleTags）'],
+];
+async function auditStylingLikeClient(lookTable, kitDir) {
+  const audit = await import('./styling_audit.mjs');
+  const kitFile = path.join(kitDir, 'kit.json');
+  if (fs.existsSync(kitFile)) {
+    const kit = JSON.parse(fs.readFileSync(kitFile, 'utf8'));
+    audit.setStylingCatalog({ source: 'cloud', version: kit.fetchedAt || '', wardrobeCapsules: kit.capsules || [] });
+  } else console.log('  ⚠ 没有形象设计资料/kit.json，形象库按 Skill 内置版本核对，可能误报「不在形象库」；先跑 looks-prepare');
+  const rows = await audit.auditLookTableStyling(lookTable);
+  const bad = rows.filter((r) => r.modelCalls?.length);
+  fs.mkdirSync(kitDir, { recursive: true });
+  fs.writeFileSync(path.join(kitDir, '客户端审核.json'), JSON.stringify(rows, null, 1), 'utf8');
+  if (!bad.length) {
+    console.log(`  ✓ 客户端造型审核：${rows.length}/${rows.length} 通过（上传后不会重调模型）  STYLING_AUDIT_PASS`);
+    return;
+  }
+  console.log(`  ✗ 客户端造型审核：${bad.length}/${rows.length} 个形象上传后会被客户端打回重调模型（扣用户积分），改 ${LOOK_DESIGN_FILE} 后重跑 assets-export：`);
+  for (const r of bad) {
+    const raw = r.issues.join(' / ');
+    const hints = [...new Set(STYLING_AUDIT_HINTS.filter(([re]) => r.issues.some((i) => re.test(i))).map(([, h]) => h))];
+    console.log(`    · ${r.tag}：${raw.slice(0, 200)}`);
+    for (const h of hints) console.log(`        → ${h}`);
+  }
+  console.log(`  明细：${path.join(kitDir, '客户端审核.json')}  STYLING_AUDIT_FAIL`);
+  process.exitCode = 2;
+}
+
+async function cmdAssetsExport() {
   const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro assets-export --dir <剧本目录> [--out 全局资产清单.md] [--title 剧名]'));
   const episodes = listScriptFiles(dir).map((f) => ({ n: episodeNoOfFile(path.basename(f)), text: fs.readFileSync(f, 'utf8') })).filter((e) => e.n > 0);
   if (!episodes.length) die('目录里没有文件名带「第N集」的剧本');
@@ -1540,6 +1765,39 @@ function cmdAssetsExport() {
   console.log(`✓ 全局资产清单 -> ${out}（同名 .json 供程序读取）`);
   const lookTable = lookTableJson(assets, { title: arg('title', '') });
   const lookFile = path.join(path.dirname(out), '形象表.json');
+  // 形象设计（looks-prepare 生成任务、Agent 按造型 AI 格式回答）：并进形象表 look.styling，客户端当作模型回答走原流程
+  const designFile = path.join(path.dirname(out), LOOK_DESIGN_FILE);
+  if (EDITION !== 'gate' && fs.existsSync(designFile)) {
+    try {
+      const st = JSON.parse(fs.readFileSync(STYLING_STATIC, 'utf8'));
+      const voiceIds = new Set(st.doubaoVoiceCandidateGuide.split('\n').map((l) => l.split('|')[0].trim()).filter(Boolean));
+      let capsuleIds = null;
+      const kitFile = path.join(path.dirname(out), LOOK_KIT_DIR, 'kit.json');
+      if (fs.existsSync(kitFile)) { try { capsuleIds = new Set(JSON.parse(fs.readFileSync(kitFile, 'utf8')).capsules.map((c) => c.id)); } catch {} }
+      const designIssues = mergeLookStylings(lookTable, JSON.parse(fs.readFileSync(designFile, 'utf8').replace(/^﻿/, '')), { voiceIds, capsuleIds });
+      const done = lookTable.characters.reduce((s, c) => s + c.looks.filter((l) => l.styling).length, 0);
+      const total = lookTable.characters.reduce((s, c) => s + c.looks.length, 0);
+      console.log(`  形象设计：${done}/${total} 个形象已设计（客户端当作造型 AI 的回答走原流程；没设计的由客户端 AI 补）`);
+      for (const x of designIssues.slice(0, 30)) console.log('  ⚠ ' + x);
+      if (designIssues.length > 30) console.log(`  … 另有 ${designIssues.length - 30} 处`);
+      if (done) await auditStylingLikeClient(lookTable, path.join(path.dirname(out), LOOK_KIT_DIR));
+    } catch (e) { console.log(`  ⚠ ${LOOK_DESIGN_FILE} 读不了：${e.message}`); }
+  }
+  // 场景道具设计（looks-prepare 生成任务、Agent 按客户端全局资产表规则填）：并进形象表 places/props
+  const placePropFile = path.join(path.dirname(out), PLACE_PROP_DESIGN_FILE);
+  if (EDITION !== 'gate' && fs.existsSync(placePropFile)) {
+    try {
+      const ppIssues = mergePlacePropDesigns(lookTable, JSON.parse(fs.readFileSync(placePropFile, 'utf8').replace(/^﻿/, '')));
+      const placeDone = (lookTable.places || []).filter((p) => p.description).length;
+      const cards = (lookTable.props || []).filter((p) => p.card === true).length;
+      const decided = (lookTable.props || []).filter((p) => p.card === true || p.card === false).length;
+      console.log(`  场景道具设计：场景 ${placeDone}/${(lookTable.places || []).length} 有描述；道具 ${decided}/${(lookTable.props || []).length} 已判定，其中建卡 ${cards} 件`);
+      for (const x of ppIssues.slice(0, 30)) console.log('  ⚠ ' + x);
+      if (ppIssues.length > 30) console.log(`  … 另有 ${ppIssues.length - 30} 处`);
+      if (!ppIssues.length) console.log('  ✓ 场景道具设计齐全  ASSET_DESIGN_PASS');
+      else { console.log(`  明细见上，改 ${PLACE_PROP_DESIGN_FILE} 后重跑  ASSET_DESIGN_FAIL`); process.exitCode = 2; }
+    } catch (e) { console.log(`  ⚠ ${PLACE_PROP_DESIGN_FILE} 读不了：${e.message}`); }
+  }
   fs.writeFileSync(lookFile, JSON.stringify(lookTable, null, 1), 'utf8');
   console.log(`✓ 形象表 -> ${lookFile}（客户端「人物设定与故事背景」上传它：按表建形象卡、按场绑定标签）`);
   for (const x of lookTableIssues(lookTable).slice(0, 20)) console.log('  ⚠ ' + x);
@@ -1549,16 +1807,456 @@ function cmdAssetsExport() {
   console.log(`  人物 ${assets.people.size}｜场景 ${assets.scenes.size}｜道具 ${assets.props.size}${assets.props.size ? '' : '（剧本里还没有【道具】行）'}${noLook ? `｜${noLook} 个形象没写外观（审核结论 looks）` : ''}`);
 }
 
+// ---------- 输入分类 + 成片工程改写（remake）：直接改客户端已分镜的工程，不重新分镜 ----------
+async function cmdInspect() {
+  const file = path.resolve(process.argv[3] && !process.argv[3].startsWith('--') ? process.argv[3] : (arg('file', '') || die('用法: chenyu-pro inspect <文件>')));
+  if (!fs.existsSync(file)) die(`找不到 ${file}`);
+  const { detectInput } = await import('./remake.mjs');
+  const r = detectInput(file);
+  console.log(`${path.basename(file)} → ${r.label}`);
+  if (r.route) console.log(`  走：${r.route}`);
+}
+
+async function cmdRemakePrepare() {
+  const src = path.resolve(arg('src', '') || die('用法: chenyu-pro remake-prepare --src <script.json|工程.xlsx> --dir <工作目录> [--images <同工程导出的.xlsx>]'));
+  const dir = path.resolve(arg('dir', '') || die('要 --dir <工作目录>（放映射表、改写单元和产出）'));
+  const rm = await import('./remake.mjs');
+  const { project, from } = await rm.loadProject(src);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, rm.REMAKE_SOURCE_FILE), JSON.stringify(project), 'utf8');
+  const imagesSrc = arg('images', '') || (from === 'xlsx' ? src : '');
+  if (imagesSrc) {
+    const img = from === 'xlsx' && path.resolve(imagesSrc) === src ? project : (await rm.loadProject(path.resolve(imagesSrc))).project;
+    fs.writeFileSync(path.join(dir, '参考图.json'), JSON.stringify({ referenceImages: img.referenceImages || {} }), 'utf8');
+  }
+  const inv = rm.inventory(project);
+  const mapFile = path.join(dir, rm.REMAKE_MAP_FILE);
+  const existing = fs.existsSync(mapFile) ? JSON.parse(fs.readFileSync(mapFile, 'utf8').replace(/^﻿/, '')) : null;
+  fs.writeFileSync(mapFile, JSON.stringify(rm.mapTemplate(inv, existing), null, 1), 'utf8');
+  console.log(`✓ 读入客户端工程（${from === 'xlsx' ? 'Excel，经客户端导入代码转换' : 'JSON'}）：《${inv.title}》${inv.episodes} 集 ${inv.tasks} 个任务，角色 ${inv.characters.length} 个，场景 ${inv.scenes.length}，道具 ${inv.props.length}${imagesSrc ? '，参考图另存 参考图.json' : ''}`);
+  for (const c of inv.characters.slice(0, 40)) console.log(`  ${c.base}（${c.gender || '?'}）出现 ${c.mentions} 处，形象 ${c.looks.length} 个`);
+  console.log(`✓ 改写映射 -> ${mapFile}：填 newBase / newGender / terms 后跑 remake-units`);
+}
+
+async function cmdRemakeUnits() {
+  const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro remake-units --dir <工作目录>'));
+  const rm = await import('./remake.mjs');
+  const map = JSON.parse(fs.readFileSync(path.join(dir, rm.REMAKE_MAP_FILE), 'utf8').replace(/^﻿/, ''));
+  const issues = rm.checkMap(map);
+  if (issues.length) { issues.forEach((x) => console.log('  ✗ ' + x)); die('改写映射有问题，改完重跑'); }
+  const original = JSON.parse(fs.readFileSync(path.join(dir, rm.REMAKE_SOURCE_FILE), 'utf8'));
+  const { rename, pairs } = rm.buildRenamer(map);
+  // 两字的替换词容易撞成语/常用词（「沉舟」撞「破釜沉舟」）：把命中处的前后文去重列出来，先看一遍再往下走
+  const shortPairs = pairs.filter(([from]) => from.length <= 2);
+  if (shortPairs.length) {
+    const corpus = rm.collectUnits(original).map((u) => u.text).join('\n');
+    const report = [];
+    for (const [from, to] of shortPairs) {
+      const ctx = new Map();
+      // 被更长的替换词覆盖的命中（「顾沉舟」里的「沉舟」）不算，只看单独出现的
+      let scan = corpus;
+      for (const [longer] of pairs) if (longer.length > from.length && longer.includes(from)) scan = scan.split(longer).join('■');
+      for (const m of scan.matchAll(new RegExp(`(.{0,3})${from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(.{0,2})`, 'g'))) ctx.set(m[0], (ctx.get(m[0]) || 0) + 1);
+      report.push(`## ${from} → ${to}（${[...ctx.values()].reduce((s, n) => s + n, 0)} 处）`, ...[...ctx].sort((a, b) => b[1] - a[1]).slice(0, 40).map(([k, n]) => `${n}\t${k.replace(/\n/g, '⏎')}`), '');
+    }
+    // 只按全名替换抓不到的单字姓说法：「我姓江」「没姓顾」「江……江经理」「小江」「老顾」
+    const renamedChars = (map.characters || []).filter((c) => c.newBase && c.newBase !== c.base && c.base.length >= 2);
+    // 叠字昵称（果果、浩浩）没有姓
+    const surnames = [...new Set(renamedChars.filter((c) => c.base[0] !== c.base[1] && c.newBase[0] !== c.base[0]).map((c) => c.base[0]))];
+    if (surnames.length) {
+      let bare = corpus;
+      for (const [from] of pairs) if (from.length >= 2) bare = bare.split(from).join('■'); // 全名、已列的称呼先遮掉
+      const S = surnames.join('');
+      const sre = new RegExp(`.{0,6}(?:姓[${S}]|[${S}](?:…|—)|[小老阿][${S}](?![客虑续])).{0,6}`, 'g');
+      const hits = new Map();
+      for (const m of bare.matchAll(sre)) hits.set(m[0], (hits.get(m[0]) || 0) + 1);
+      report.push(`## 单字姓说法（${surnames.join('、')}；全名替换抓不到，确认后写进 terms 或 lateTerms）`, ...[...hits].map(([k, n]) => `${n}\t${k.replace(/\n/g, '⏎')}`), '');
+    }
+    fs.mkdirSync(path.join(dir, rm.REMAKE_UNIT_DIR), { recursive: true });
+    fs.writeFileSync(path.join(dir, rm.REMAKE_UNIT_DIR, '替换命中.txt'), report.join('\n'), 'utf8');
+    console.log(`  两字替换词的命中上下文 -> ${rm.REMAKE_UNIT_DIR}/替换命中.txt（看有没有撞成语/常用词；撞了就把 terms 改成更长的词，或改完后在 lateTerms 里改回）`);
+  }
+  const renamed = rm.renameDeep(original, rename);
+  fs.writeFileSync(path.join(dir, rm.REMAKE_RENAMED_FILE), JSON.stringify(renamed), 'utf8');
+  const units = rm.collectUnits(renamed);
+  const swapped = rm.swappedBases(map);
+  const swappedNames = (map.characters || []).filter((c) => swapped.has(c.base)).map((c) => c.newBase || c.base);
+  const unitDir = path.join(dir, rm.REMAKE_UNIT_DIR);
+  const index = rm.writeUnitFiles(unitDir, units, swappedNames);
+  const charFile = path.join(unitDir, rm.REMAKE_CHAR_FILE);
+  const prevChars = fs.existsSync(charFile) ? JSON.parse(fs.readFileSync(charFile, 'utf8')) : [];
+  // 免费版不做形象重新设计（要账号授权）；换了性别的形象需要 Pro 重新设计
+  const chars = EDITION === 'gate' ? [] : rm.charTemplate(original, map, prevChars);
+  if (EDITION === 'gate' && rm.swappedBases(map).size) console.log('  ⚠ 有角色换了性别：免费版只改文字，形象（长相、服装、音色）要用辰屿 Pro 重新设计，否则出图还是原性别');
+  fs.writeFileSync(charFile, JSON.stringify(chars, null, 1), 'utf8');
+  const st = JSON.parse(fs.readFileSync(STYLING_STATIC, 'utf8'));
+  // 形象重设计任务书：和客户端造型 AI 同一套知识库规则，思考由 Agent 做
+  if (chars.length) {
+    const kit = await fetchStylingKit(path.join(dir, LOOK_KIT_DIR));
+    const book = [
+      `# 形象重设计任务（${chars.length} 个形象，填 ${rm.REMAKE_UNIT_DIR}/${rm.REMAKE_CHAR_FILE} 每条的 new）`, '',
+      '洗稿重做形象的目标：和原片拉开辨识度——脸型、发型、主色调、配色都换；保留原形象的服装类别和状态（病号服仍是病号服、手术服仍是手术服、制服仍是制服）、年龄段、身份。',
+      '先整部剧一次规划：主要角色之间脸型、发型、主色调互相错开；同一个人（base 相同）的各形象脸、身材、发型、发色一致，只按状态换装，用同一个音色；群像写成一群人的统一装束和代表成员。',
+      'old 是原造型，只作参考身份/状态，不要照抄它的脸、发型、配色。swapped=true 的是换了性别的角色。', '',
+      '每条 new 填：',
+      '- styleDescription：按 性别→年龄段→外观特征→脸部→身材→发型→服饰类型→发色→主色调→部件配色→视觉锚点 写，≥120 字，结尾可加「双手自然放松，仅展示稳定角色造型，不携带临时道具」。',
+      '- appearanceFeatures：一句外观锚点；shortDescription：如「女人 黑色低马尾 冰川蓝开衫」；state：沿用或按新设定改写原状态。',
+      '- voice（如 女-青年-知性）、voiceRefDescription（以「青年女声」这类开头，≤4 个声学特征）、doubaoVoiceId（下面候选里的确切 ID，性别和年龄档要对）。',
+      '', '客户端审核最常打回的几处，动笔就避开：', ...STYLING_AUDIT_HINTS.slice(0, 6).map(([, h]) => `- ${h}`), '',
+      '## 一、造型核心规则（知识库 styling.core_rules）', kit.coreRules, '',
+      '## 二、音色库键名参考（知识库 styling.voice_preset_guide）', kit.voicePresetGuide, '',
+      '## 三、豆包音色候选', st.doubaoVoiceCandidateGuide, '',
+      '填完跑 remake-apply：每个形象都过客户端造型审核（和客户端同一份代码），有问题会列出来，改到 REMAKE_PASS。',
+    ].join('\n');
+    fs.writeFileSync(path.join(unitDir, '角色设计任务.md'), book, 'utf8');
+  }
+  const task = [
+    `# 成片工程改写任务：《${map.title?.old || ''}》${map.title?.new ? ` → 《${map.title.new}》` : ''}`,
+    '', `方向：${map.direction || '（改写映射里 direction 没写）'}`, '',
+    '已经由工具完成：角色改名、terms 精确替换（整个工程，含标签、台词、资产表；文件路径不动）。',
+    `换性别的角色：${swappedNames.join('、') || '无'}。下面两件事由你做：`, '',
+    '## 一、逐行改写（每个 第NN集.txt / 剧本与文字.txt）',
+    '- 每个单元是一段分镜脚本或剧本原文，带行号。只改需要改的行：换性别角色的代词（她↔他）、称谓（老公↔老婆、嫂子↔姐夫、女士↔先生…）、外貌（长发/裙装 ↔ 短发/西装）、身体相关情节的等价替换（保持剧情功能）、台词里的音色括注。',
+    '- 剧情、镜头数、每镜时长、动作走位、字段结构都不改；没换性别的人和事不动。',
+    '- 输出写到同名的 .patch.json：{"单元id": {"行号": "整行新内容"}}，只写改了的行；一行对一行，不能含换行；### SHOT 行和 time: 行不能改；action:/prompt:/dialogue: 等字段名保持。',
+    '- 标签只用工程里已有的（改名后的）[角色-形象]、[场景]、[道具]，不新增标签。',
+    '',
+    `## 二、换性别形象的新造型（${path.join(rm.REMAKE_UNIT_DIR, rm.REMAKE_CHAR_FILE)}，共 ${chars.length} 个）`,
+    '- 每条 old 是原造型，填 new：styleDescription（按 性别→年龄段→外观特征→脸部→身材→发型→服饰类型→发色→主色调→部件配色→视觉锚点 写，≥120 字，段尾不能以「和与及为呈穿套披系戴配搭、，」结尾）、appearanceFeatures（一句外观锚点）、shortDescription（如「男人 黑色短发 深蓝套装」）、voice（如 男-青年-清冷）、voiceRefDescription（以「青年男声」这类开头）、doubaoVoiceId（下方候选里的确切 ID，性别和年龄档要对）。',
+    '- 同一个人各形象脸、身材、发型、发色一致，只按状态换装；同一人用同一音色。服装状态（病号服、手术服、大衣）沿用原形象名的含义。',
+    '',
+    '## 三、豆包音色候选', st.doubaoVoiceCandidateGuide, '',
+    '填完跑 `chenyu-pro remake-apply --dir <工作目录>`，改到 REMAKE_PASS。',
+  ].join('\n');
+  fs.writeFileSync(path.join(unitDir, '改写任务.md'), task, 'utf8');
+  console.log(`✓ 改名：${pairs.length} 组精确替换 -> ${rm.REMAKE_RENAMED_FILE}`);
+  console.log(`✓ 改写单元 -> ${unitDir}（任务书 改写任务.md）`);
+  for (const x of index) console.log(`  ${x.file}：${x.units} 个单元，${x.needs} 个涉及换性别角色 → 补丁写 ${x.patch}`);
+  console.log(`  ${rm.REMAKE_CHAR_FILE}：${chars.length} 个形象待重新设计（${(map.redesignLooks || 'all') === 'all' ? '全部形象重做' : '只重做换性别的'}；任务书 角色设计任务.md）`);
+}
+
+// 审稿读本：补丁打完后的当前文本（行号和改写单元一致），给审稿 Agent 逐集通读；问题写成 改写/审核_*.patch.json（最后生效）
+async function cmdRemakeReview() {
+  const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro remake-review --dir <工作目录>'));
+  const rm = await import('./remake.mjs');
+  const map = JSON.parse(fs.readFileSync(path.join(dir, rm.REMAKE_MAP_FILE), 'utf8').replace(/^﻿/, ''));
+  const project = JSON.parse(fs.readFileSync(path.join(dir, rm.REMAKE_RENAMED_FILE), 'utf8'));
+  const unitDir = path.join(dir, rm.REMAKE_UNIT_DIR);
+  const units = rm.collectUnits(project);
+  rm.applyUnitPatches(project, units, rm.readPatches(unitDir));
+  // 角色卡也按新造型/补形象落好，体检和合并时一致
+  const charFileR = path.join(unitDir, rm.REMAKE_CHAR_FILE);
+  if (fs.existsSync(charFileR)) rm.applyCharacters(project, JSON.parse(fs.readFileSync(charFileR, 'utf8')).filter((e) => e.new?.styleDescription));
+  rm.applySceneMapEdits(project, map.sceneMapEdits);
+  const reviewDir = path.join(dir, '审核');
+  fs.mkdirSync(reviewDir, { recursive: true });
+  const now = (u) => String(u.where[0].reduce((o, k) => o?.[k], project) || '');
+  // 剧本全文（可读版，带单元 id 和行号，主审通读用）
+  const chapterUnits = units.filter((u) => u.kind === 'text' && u.where.some((w) => w[0] === 'novelChapters' && w[2] === 'content'));
+  fs.writeFileSync(path.join(reviewDir, '剧本全文.txt'), chapterUnits.map((u) => [`=== ${u.id}  ${u.label}`, ...now(u).split('\n').map((l, i) => `${i + 1}| ${l}`), ''].join('\n')).join('\n'), 'utf8');
+  // 每集分镜：只列台词、动作、画面行（行号同单元），读起来像一集戏
+  const byEp = new Map();
+  for (const u of units.filter((x) => x.kind === 'task')) { if (!byEp.has(u.episode)) byEp.set(u.episode, []); byEp.get(u.episode).push(u); }
+  for (const [ep, list] of byEp) {
+    const body = list.sort((a, b) => a.task - b.task).map((u) => [`=== ${u.id}  ${u.label} 任务${u.task + 1}`,
+      ...now(u).split('\n').map((l, i) => [i + 1, l]).filter(([, l]) => /^(###\s*SHOT|镜头角色|action|dialogue|sfx)\s*[:：]?/i.test(l.trim())).map(([i, l]) => `${i}| ${l}`), ''].join('\n')).join('\n');
+    fs.writeFileSync(path.join(reviewDir, `第${String(ep).padStart(2, '0')}集_分镜读本.txt`), body, 'utf8');
+    // 完整当前文本（所有行，补丁已打）：修订补丁以这里的行内容为底
+    const full = list.sort((a, b) => a.task - b.task).map((u) => [`=== ${u.id}  ${u.label} 任务${u.task + 1}`, ...now(u).split('\n').map((l, i) => `${i + 1}| ${l}`), ''].join('\n')).join('\n');
+    fs.writeFileSync(path.join(reviewDir, `第${String(ep).padStart(2, '0')}集_当前全文.txt`), full, 'utf8');
+  }
+  // 分镜标签体检（客户端同一套检查）：按集列出 单元id+行号，原片就有的也一并修
+  const original = JSON.parse(fs.readFileSync(path.join(dir, rm.REMAKE_SOURCE_FILE), 'utf8'));
+  const findings = (await rm.storyboardFindings(project, rm.renameDeep(original, rm.buildRenamer(map).rename), units)) || [];
+  const sbAvailable = fs.existsSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'storyboard_audit.mjs'));
+  const fByEp = new Map();
+  for (const f of findings) { if (!fByEp.has(f.episode)) fByEp.set(f.episode, []); fByEp.get(f.episode).push(f); }
+  // 已清零的集不留旧清单（文件不存在 = 该集没有问题）
+  for (const name of fs.readdirSync(reviewDir)) if (/_分镜标签问题\.txt$/.test(name)) fs.unlinkSync(path.join(reviewDir, name));
+  for (const [ep, list] of fByEp) {
+    fs.writeFileSync(path.join(reviewDir, `第${String(ep).padStart(2, '0')}集_分镜标签问题.txt`), list.map((f) => `${f.unit} ${f.line}| ${f.preexisting ? '[原片就有]' : '[改写新增]'} ${f.detail}`).join('\n') + '\n', 'utf8');
+  }
+  if (!sbAvailable) console.log('  （分镜标签体检模块未安装，跳过；审稿时人工核对镜头角色和标签）');
+  else console.log(`  分镜标签体检：${findings.length} 处（改写新增 ${findings.filter((f) => !f.preexisting).length}，原片就有 ${findings.filter((f) => f.preexisting).length}）-> 审核/第NN集_分镜标签问题.txt`);
+  const swapped = (map.characters || []).filter((c) => rm.swappedBases(map).has(c.base)).map((c) => `${c.base}→${c.newBase || c.base}（${c.gender}→${c.newGender}）`);
+  const guide = [
+    `# 改写审稿（${map.title?.new || map.title?.old || ''}）`, '',
+    `方向：${map.direction || ''}`, swapped.length ? `换性别：${swapped.join('、')}` : '', '',
+    '## 审什么（按观众视角读，不是查格式）',
+    '1. 剧情顺不顺：改写后的台词和动作连起来读得通吗？有没有前后矛盾、接不上、语气突兀、指代不清。',
+    '2. 设定一致：改写说明里的人物关系、等价替换线（如换性别后替换掉的情节）在每一集都一致，没有残留旧设定、没有自相矛盾。',
+    '3. 指代和称谓：他/她、称呼、自称都指对了人；同一称呼全剧统一。',
+    '4. 分镜和剧本一致：同一句台词在剧本章节和分镜 dialogue 里一致；动作描写和新形象（发型、服装、性别）一致。',
+    '5. 跨集衔接：每集开头接得上上一集结尾，钩子还在。',
+    '6. 分镜标签 bug（第NN集_分镜标签问题.txt，客户端同一套检查，原片就有的也修）：',
+    '   - 「character absent from charactersInShot」：动作/画面写了这个人物标签，镜头角色行没有。人在画面里 → 把标签加进该 SHOT 的「镜头角色:」行；人不在画面里（电话、画外、回忆提及）→ 把那处方括号标签改成不带方括号的名字。',
+    '   - 「declared character not referenced」：镜头角色列了人，画面提示没写到 → 人在画面里就在 prompt 里用标签写出他的位置动作；不在就从镜头角色行删掉。',
+    '   - 「uses unknown tag」：标签不在资产目录（如 [系统-界面形态]）→ 是界面/系统提示音就去掉方括号写成普通文字；是漏建的人物要在结论里写明。',
+    '   - 修完的 SHOT 里镜头角色、动作、画面、台词说话人要互相对得上。',
+    '', '## 怎么交',
+    '- 发现的问题写进 审核/审核结论_<范围>.md：每条写 位置（单元id+行号）/ 问题 / 改法。',
+    '- 能直接改的写成修订补丁 改写/审核_<范围>.patch.json，格式同改写补丁 {"单元id": {"行号": "整行新内容"}}——以读本里显示的当前内容为底改，最后生效。',
+    '- 不改剧情结构、镜头、时长、标签；只修顺、修逻辑、修指代。',
+    '- 写完跑 remake-lint 查结构，再跑 remake-apply 到 REMAKE_PASS。',
+  ].filter((x) => x !== null).join('\n');
+  fs.writeFileSync(path.join(reviewDir, '审稿说明.md'), guide, 'utf8');
+  console.log(`✓ 审稿读本 -> ${reviewDir}：剧本全文.txt（主审通读）、第NN集_分镜读本.txt ×${byEp.size}、审稿说明.md`);
+  console.log('  审稿结论写 审核/审核结论_*.md，修订补丁写 改写/审核_*.patch.json（合并时最后生效）');
+}
+
+// 只查一个补丁文件（不写工程）：结构问题 + 打完补丁后这些单元里换性别角色同行还挂着原性别词的行
+async function cmdRemakeLint() {
+  const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro remake-lint --dir <工作目录> --file 第01集.patch.json'));
+  const name = arg('file', '') || die('要 --file <补丁文件名>');
+  const rm = await import('./remake.mjs');
+  const map = JSON.parse(fs.readFileSync(path.join(dir, rm.REMAKE_MAP_FILE), 'utf8').replace(/^﻿/, ''));
+  const project = JSON.parse(fs.readFileSync(path.join(dir, rm.REMAKE_RENAMED_FILE), 'utf8'));
+  const units = rm.collectUnits(project);
+  const patchFile = path.join(dir, rm.REMAKE_UNIT_DIR, path.basename(name));
+  const patches = JSON.parse(fs.readFileSync(patchFile, 'utf8').replace(/^﻿/, ''));
+  const mine = new Set(Object.keys(patches));
+  // 改写补丁有同名单元文件（第01集.txt）；审稿补丁（审核_*.patch.json）跨单元，按补丁里出现的单元查
+  const txtFile = patchFile.replace(/\.patch\.json$/, '.txt');
+  const isReview = path.basename(name).startsWith('审核');
+  const fileUnits = fs.existsSync(txtFile) ? new Set([...fs.readFileSync(txtFile, 'utf8').matchAll(/^=== (\S+)/gm)].map((m) => m[1])) : new Set(mine);
+  // 审稿补丁以「其他补丁打完后的当前内容」为底：先打其他补丁，再打这一份
+  if (isReview) {
+    const others = rm.readPatches(path.join(dir, rm.REMAKE_UNIT_DIR));
+    for (const [id, lines] of Object.entries(patches)) for (const no of Object.keys(lines)) if (others[id]) delete others[id][no];
+    rm.applyUnitPatches(project, units, others);
+    for (const u of units) u.text = String(u.where[0].reduce((o, k) => o?.[k], project) || '');
+  }
+  const { issues, changedLines } = rm.applyUnitPatches(project, units, patches);
+  for (const id of mine) if (!fileUnits.has(id)) issues.push(`单元 ${id} 不在 ${path.basename(name).replace('.patch.json', '.txt')} 里`);
+  const swapped = (map.characters || []).filter((c) => rm.swappedBases(map).has(c.base));
+  const wrongRe = (c) => (String(c.newGender).startsWith('男') ? /她|女士|女人|女性|姑娘|小姐|夫人|太太|长发|裙|马尾|麻花辫|发髻/ : /他(?!们)|先生|男人|男性|小伙|大背头/);
+  const voiceCue = /（[^（）]*[男女]声[^（）]*）/g;
+  const left = [];
+  for (const u of units) {
+    if (!fileUnits.has(u.id)) continue;
+    const text = String(u.where[0].reduce((o, k) => o?.[k], project) || '');
+    text.split('\n').forEach((line, i) => {
+      const bare = line.replace(voiceCue, '');
+      for (const c of swapped) { const n = c.newBase || c.base; if (bare.includes(n) && wrongRe(c).test(bare)) { left.push(`${u.id} ${i + 1}| ${line.slice(0, 110)}`); break; } }
+    });
+  }
+  console.log(`补丁 ${Object.keys(patches).length} 个单元 ${changedLines} 行；结构问题 ${issues.length} 处；换性别角色同行仍有原性别词 ${left.length} 行（可能指别人，逐条确认；音色括注由工具自动换，不算）`);
+  for (const x of issues.slice(0, 50)) console.log('  ✗ ' + x);
+  for (const x of left.slice(0, 80)) console.log('  ? ' + x);
+}
+
+async function cmdRemakeApply() {
+  const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro remake-apply --dir <工作目录> [--out 新工程.json]'));
+  const rm = await import('./remake.mjs');
+  const map = JSON.parse(fs.readFileSync(path.join(dir, rm.REMAKE_MAP_FILE), 'utf8').replace(/^﻿/, ''));
+  const original = JSON.parse(fs.readFileSync(path.join(dir, rm.REMAKE_SOURCE_FILE), 'utf8'));
+  const project = JSON.parse(fs.readFileSync(path.join(dir, rm.REMAKE_RENAMED_FILE), 'utf8'));
+  const unitDir = path.join(dir, rm.REMAKE_UNIT_DIR);
+  const units = rm.collectUnits(project);
+  const patched = rm.applyUnitPatches(project, units, rm.readPatches(unitDir));
+  rm.rebuildAdaptationFromChapters(original, project);
+  const chars = fs.existsSync(path.join(unitDir, rm.REMAKE_CHAR_FILE)) ? JSON.parse(fs.readFileSync(path.join(unitDir, rm.REMAKE_CHAR_FILE), 'utf8')) : [];
+  const charRes = rm.applyCharacters(project, chars);
+  const sceneEdits = rm.applySceneMapEdits(project, map.sceneMapEdits);
+  const cueSwaps = rm.swapVoiceCues(project, units, charRes.voiceSwaps);
+  rm.clearGenerated(project);
+  let img = { filled: 0, missing: 0 };
+  if (fs.existsSync(path.join(dir, '参考图.json'))) {
+    const { rename } = rm.buildRenamer(map);
+    const refs = rm.renameDeep(JSON.parse(fs.readFileSync(path.join(dir, '参考图.json'), 'utf8')), rename);
+    img = rm.fillImagesFrom(project, refs, arg('storage', ''));
+  }
+  // 补充替换：改写过程中才发现的漏网称呼/误换（如「顾主任」「破釜若岚」），最后对整个工程再做一次精确替换（标签、目录、图片键都覆盖），不影响已写好的补丁
+  if (Array.isArray(map.lateTerms) && map.lateTerms.some((t) => t.from)) {
+    const late = rm.buildRenamer({ terms: map.lateTerms });
+    Object.assign(project, rm.renameDeep(project, late.rename));
+  }
+  if (map.title?.new) project.title = map.title.new;
+  project.updatedAt = Date.now();
+  const { issues, warnings } = rm.remakeChecks(original, project, map);
+  // 分镜标签体检（客户端同一套）：改写新增的算问题；原片就有的列数量，审稿时一并修
+  const sbFindings = (await rm.storyboardFindings(project, rm.renameDeep(original, rm.buildRenamer(map).rename), units)) || [];
+  const sbNew = sbFindings.filter((f) => !f.preexisting);
+  for (const f of sbNew.slice(0, 20)) issues.push(`分镜标签（改写新增）第${f.episode}集 ${f.unit} ${f.line}行：${f.detail}`);
+  if (sbNew.length > 20) issues.push(`分镜标签（改写新增）另有 ${sbNew.length - 20} 处`);
+  if (sbFindings.length - sbNew.length) warnings.push(`分镜标签：原片就有的问题还剩 ${sbFindings.length - sbNew.length} 处（remake-review 的 审核/第NN集_分镜标签问题.txt，审稿时修）`);
+  // 换性别形象：用客户端原样的造型审核看描述和音色（这些卡不会再进客户端造型，审核只做提示）
+  const auditNotes = [];
+  const audit = chars.some((e) => e.new?.styleDescription) ? await import('./styling_audit.mjs') : null;
+  for (const e of chars) {
+    if (!e.new?.styleDescription) continue;
+    const r = await audit.auditLookStyling({ characterName: e.tag, gender: e.newGender === '男' ? 'male' : e.newGender === '女' ? 'female' : '', species: e.species || '', appearanceFeatures: e.new.appearanceFeatures || '', stateLabel: e.state || '',
+      styling: { description: e.new.styleDescription, voicePresetKey: e.new.voice, voiceRefDescription: e.new.voiceRefDescription, ttsProvider: 'Doubao', doubaoVoiceId: e.new.doubaoVoiceId, doubaoVoiceModel: 'seed-tts-2.0', doubaoVoiceSpeed: 1 } });
+    const bad = (r.issues || []).filter((x) => !/wardrobeCapsuleId|classification missing/.test(x));
+    if (bad.length) auditNotes.push(`${e.tag}：${bad.join(' / ').slice(0, 200)}`);
+  }
+  const out = path.resolve(arg('out', path.join(dir, `${(project.title || 'remake').replace(/[\\/:*?"<>|]/g, '_')}.json`)));
+  fs.writeFileSync(out, JSON.stringify(project), 'utf8');
+  console.log(`✓ 补丁：${patched.changedUnits} 个单元 ${patched.changedLines} 行；换性别形象 ${chars.filter((e) => e.new?.styleDescription).length}/${chars.length} 个已落；台词音色括注替换 ${cueSwaps} 处；旧成片已清；参考图补 ${img.filled} 张${img.missing ? `（${img.missing} 张本机打不开，导入后需重出）` : ''}`);
+  const all = [...patched.issues, ...charRes.issues, ...issues, ...auditNotes.map((x) => `造型审核不通过 ${x}`)];
+  for (const x of all.slice(0, 40)) console.log('  ✗ ' + x);
+  if (all.length > 40) console.log(`  … 另有 ${all.length - 40} 处`);
+  for (const x of warnings.slice(0, 20)) console.log('  ⚠ ' + x);
+  console.log(`✓ 新工程 -> ${out}（客户端侧边栏「导入」选这个 .json；换性别的形象没有图，导入后先补出角色图，再出视频）`);
+  console.log(all.length ? '  REMAKE_FAIL（改完重跑 remake-apply）' : '  REMAKE_PASS');
+  if (all.length) process.exitCode = 2;
+}
+
+// 使用说明（安装完自动显示；chenyu-pro guide 看全部，chenyu-pro guide 视频 只看一节）。只讲怎么用，每种场景一个实例。
+// 排版：■ 节标题 + 分隔线；◆ 场景；▶ 你说；✓ 得到；※ 说明。只用终端都能显示的符号（不用 emoji）。
+const GUIDE_RULE = '─'.repeat(54);
+const renderGuide = (title, sections, topic = '') => {
+  const picked = topic ? sections.filter((s) => s.key === topic || topic.includes(s.key)) : sections;
+  const out = ['', '━'.repeat(58), ` ${title}${topic && picked.length ? '：' + topic : ''}`, '━'.repeat(58), ''];
+  for (const s of picked.length ? picked : sections) {
+    out.push(`■ ${s.title}`, `  ${GUIDE_RULE}`);
+    for (const l of s.lines || []) out.push(`  ${l}`);
+    for (const n of s.notes || []) out.push(`  ※ ${n}`);
+    (s.scenes || []).forEach((sc, i) => {
+      out.push('', `  ◆ 场景 ${i + 1}：${sc.name}`);
+      out.push(`      ▶ 你说：「${sc.say}」`);
+      if (sc.get) out.push(`      ✓ 得到：${sc.get}`);
+      for (const n of [].concat(sc.note || [])) out.push(`      ※ ${n}`);
+    });
+    out.push('');
+  }
+  out.push('━'.repeat(58));
+  console.log(out.join('\n'));
+};
+
+const PRO_GUIDE_SECTIONS = [
+  { key: '开始', title: '开始：绑定积分 KEY（只做一次）', lines: [
+    'chenyu-pro key set <你的积分KEY>',
+    'chenyu-pro credits            ← 看到用户名和余额就成功了'],
+    notes: ['之后在 Codex / Claude Code 里用大白话说需求，命令由 Agent 自己跑，你不用记命令',
+      '拿不准手上的文件该怎么处理，就说「看看这个文件该怎么用」'] },
+  { key: '视频', title: '一、视频反推剧本 —— 手上只有成片视频',
+    notes: ['计费：每 240 秒视频 30 积分（不足按一段算），Agent 先报价，你同意才扣；后面写剧本不扣积分'],
+    scenes: [
+      { name: '整部剧 1:1 还原', say: '把 D:\\短剧\\霸总 里第1-30集视频反推成剧本，1:1 还原，台词保留原句',
+        get: '分集剧本 + 全局资产清单 + 形象表.json + 交付审核报告',
+        note: '过程：分析视频 → 整理人物/场景/道具 → 逐集写剧本 → 格式和交付检查 → 写入原片时长' },
+      { name: '反推的同时洗稿', say: '把这 20 集视频反推，同时洗成现代都市背景，人名全换',
+        get: '洗好的新剧本（剧情节拍不变，设定和名字换掉）+ 形象表.json' },
+      { name: '先分析前几集，后面再追加', say: '先分析第1-10集 …（过几天）… 把第11-20集追加到同一部剧',
+        note: '同一部剧一定追加到同一个项目，人物会跨集合并；不要一集开一个项目' },
+      { name: '中途断网 / 想重新取分析稿', say: '上次那部剧的分析稿重新取回来', note: '不重新分析，不扣积分' },
+      { name: '人物认错了（一个人被拆成两个、两个人被合成一个）', say: '用已有分析结果重建人物身份',
+        note: '不重看视频，只扣少量文本分' },
+      { name: '视频在链接里', say: '分析这个链接里的视频：https://…/ep01.mp4' },
+    ] },
+  { key: '改编', title: '二、小说改编成短剧 —— 手上是小说 / 网文 / 大纲', scenes: [
+      { name: '整本改编', say: '把 D:\\小说\\重生千金.txt 改编成 60 集短剧，每集 90 秒，节奏要快',
+        get: '分集剧本（每集开头有钩子、结尾有悬念）+ 形象表.json' },
+      { name: '先试几集看风格', say: '先把前 5 章改成 5 集，我看看风格',
+        note: '满意后说「继续改后面的」，人物和形象沿用前面的设定' },
+    ] },
+  { key: '洗稿', title: '三、剧本洗稿 —— 手上是分集剧本（第N集…）',
+    notes: ['所有洗法都走：定人名设定 → 逐集写 → 机器检查 → 分段审稿 → 全剧主审 → 修订 → 通读，全部通过才交付，附审核报告'],
+    scenes: [
+      { name: '只改角色名（最常用）', say: '这部剧只改角色名字，其他都不动', get: '名字和称呼全剧统一替换，台词其余一字不改，没有旧名残留' },
+      { name: '1:1 整理成标准格式（不洗）', say: '按原剧本 1:1 整理成标准格式，剧情台词都不改' },
+      { name: '换背景 / 换设定', say: '把这部古装剧洗成现代豪门背景，身份职业都换成现代的',
+        note: '剧情功能不变，道具、身份、称谓按新世界等价替换（如 玉佩 → 股权书）' },
+      { name: '女频改男频（或男频改女频）', say: '把这部剧女频改男频，女主改成男主，剧情节奏不变',
+        note: '代词、称谓、外貌全部换性别；男女不通用的情节按功能等价替换' },
+      { name: '降重 / 去重', say: '这部剧要降重，台词全部换说法，剧情不变', note: '每句台词保留功能（威胁、打脸、反转…），换句式和措辞' },
+      { name: '出海', say: '把这部剧洗成日本版',
+        note: ['也可：欧美英语、拉美西语、巴西葡语、韩国、泰国、越南、印尼', '人名、地名、机构、货币、称谓按当地本地化，剧本正文用中文写'] },
+    ] },
+  { key: '形象', title: '四、人物形象设计 —— 让客户端照表建卡，不用自己猜', scenes: [
+      { name: '给剧本做形象设计', say: '给这部剧的所有人物做形象设计，导出形象表',
+        get: '形象表.json：每个形象都有长相、发型、服装配色、音色；场景和道具有出图描述',
+        note: '上传客户端后直接出图，不用再等客户端设计' },
+      { name: '已有形象表，只补缺的', say: '形象表里没设计的形象帮我补上' },
+    ] },
+  { key: '工程', title: '五、已分镜爆款工程改写 —— 手上是客户端导出的 .json 或 .xlsx',
+    notes: ['不重新分镜：镜头数、每镜时长一个不动，只改文字、人物、音色'],
+    scenes: [
+      { name: '只改名 + 形象重做', say: '这个爆款工程不用重新分镜，角色全部改名，形象重新设计', get: '新工程 .json' },
+      { name: '女频改男频', say: '这个工程女频改男频，主角换成男的，形象重新设计', get: '新工程 .json（剧情和分镜都审过）' },
+      { name: '同一个工程有 .json 也有 .xlsx', say: '用这个 .json 改，图片从 .xlsx 里补' },
+    ] },
+  { key: '交付', title: '交付物在辰屿客户端怎么用', lines: [
+    '剧本 + 形象表.json  →  新建项目贴剧本，在「人物设定与故事背景」上传形象表',
+    '                        → 客户端按表建人物/场景/道具卡 → 分镜 → 出视频',
+    '新工程 .json        →  左侧边栏「导入」→ 资产页先出角色图 → 出视频'],
+    notes: ['积分：只有视频反推扣积分；写剧本、洗稿、形象设计、工程改写都不扣',
+      '网络：连不上会自动改走系统代理；还不通就设置 CHENYU_PROXY=http://127.0.0.1:7890',
+      '命令表：chenyu-pro help ｜ 只看一节：chenyu-pro guide 视频 / 改编 / 洗稿 / 形象 / 工程 / 交付',
+      '升级：重新运行安装命令'] },
+];
+
+const GATE_GUIDE_SECTIONS = [
+  { key: '开始', title: '开始', lines: ['装好就能用：纯本地，不联网，不用账号，不扣积分'],
+    notes: ['在 Codex / Claude Code 里用大白话说需求，命令由 Agent 自己跑'] },
+  { key: '用法', title: '每种用法一个例子', scenes: [
+      { name: '小说改编成短剧剧本', say: '把 D:\\小说\\重生千金.txt 改编成 40 集短剧剧本，每集 90 秒左右',
+        get: '每集一个剧本文件（第001集.txt …），格式检查全部通过' },
+      { name: '剧本只改角色名', say: 'D:\\剧本\\ 这部剧只改角色名字，其他都不动', get: '换好名字的整套剧本，全剧称呼统一，没有旧名残留' },
+      { name: '剧本洗稿（换背景 / 女频改男频 / 降重）', say: '把这部剧洗成男频，主角改成男的，剧情节奏不变',
+        get: '新剧本 + 洗稿检查报告（照抄、旧名残留、剧情是否完整、称呼是否统一）' },
+      { name: '整理资产：人物形象、场景、道具清单', say: '把这部剧的人物、形象、场景、道具整理成清单，导出形象表',
+        get: '全局资产清单 + 形象表.json', note: '在辰屿客户端「人物设定与故事背景」上传形象表，客户端按表建卡、按场绑标签' },
+      { name: '已分好镜的工程改写（客户端导出的 .json / .xlsx）', say: '这个工程不用重新分镜，角色全部改名，台词里的称呼也改掉',
+        get: '新工程 .json，镜头数和时长不变', note: '在客户端左侧「导入」即可' },
+      { name: '只检查剧本格式', say: '检查一下 D:\\剧本\\ 的格式，按报告改到通过', get: '逐行问题报告和改法，改到 GATE_PASS' },
+    ] },
+  { key: '格式', title: '剧本格式（Agent 照这个写）', lines: [
+    '第001集 离婚协议',
+    '1-1 日 内 客厅',
+    '人物：林晚、陈序',
+    '【形象】林晚=少夫人；陈序=总裁',
+    '客厅灯光昏黄，茶几上摆着离婚协议。',
+    '△林晚把协议推到陈序面前，指尖发白。',
+    '林晚：（冷冷地）签吧。',
+    '△陈序盯着她，迟迟没有拿笔。',
+    '陈母（电话里）：你敢签字就别回家！'],
+    notes: ['只在电话里出声的人，括号写在冒号前，不列进「人物」行'] },
+  { key: '更多', title: '需要完整版（辰屿 Pro）的功能', lines: ['视频反推剧本 ｜ 人物形象设计（长相、服装、音色）｜ 换性别后重新设计形象 ｜ 交付到辰屿平台'],
+    notes: ['命令表：chenyu-gate help ｜ 本说明：chenyu-gate guide', '升级：重新运行安装命令'] },
+];
+
+function cmdGuide() {
+  const topic = String(args[1] || '').trim();
+  if (EDITION === 'gate') return renderGuide(`辰屿剧本工具 免费版 v${VERSION}`, GATE_GUIDE_SECTIONS, topic);
+  return renderGuide(`辰屿 Pro Skill v${VERSION} 使用说明`, PRO_GUIDE_SECTIONS, topic);
+}
+
 function cmdVersion() {
   console.log(`chenyu-pro v${VERSION}`);
 }
 
 function cmdHelp() {
+  if (EDITION === 'gate') {
+    console.log(`辰屿剧本工具 免费版 v${VERSION}（纯本地，不联网，不用账号）
+
+  chenyu-gate guide                                      使用说明（每种用法一个例子）
+  chenyu-gate inspect <文件>                              判断是小说 / 剧本 / 客户端工程，该怎么处理
+  【写剧本、洗稿】
+  chenyu-gate gate --file 第001集.txt | --dir <目录>      格式检查，改到 GATE_PASS
+  chenyu-gate variants --dir <目录>                       汇总每个人物的形象
+  chenyu-gate rename --dir <目录> …                        按改名表精确换名
+  chenyu-gate wash-check --dir <目录> --source <原稿目录>   洗稿检查：照抄、旧名残留
+  chenyu-gate deliver-check --dir <目录> --source <原稿目录> 交付检查：剧情完整、称呼、逻辑，到 DELIVERY_PASS
+  chenyu-gate durations --dir <目录> …                     写入原片时长
+  【资产】
+  chenyu-gate assets-prepare --dir <分析稿目录>            整理人物、场景、道具候选
+  chenyu-gate assets-apply --dir <分析稿目录>              按合并表整理
+  chenyu-gate assets-export --dir <剧本目录>               导出全局资产清单 + 形象表.json
+  【已分镜工程改写（客户端导出的 .json / .xlsx）】
+  chenyu-gate remake-prepare --src <工程文件> --dir <工作目录>
+  chenyu-gate remake-units | remake-lint | remake-review | remake-apply --dir <工作目录>
+
+  视频反推、形象设计、平台交付需要辰屿 Pro 完整版。`);
+    return;
+  }
   console.log(`辰屿 Pro CLI v${VERSION} —— 剧本平台命令行（Agent 写作模式：平台只鉴权，写作零积分）
 
   chenyu-pro login --web                                   网页授权登录你的账号（推荐；项目归你账号，KEY 自动带出）
   chenyu-pro login --username <账号> --password <密码>     密码登录你的账号
   chenyu-pro key set <积分KEY> | key show                  仅绑积分 KEY（快速免密，但走独立身份）
+  chenyu-pro guide                                         使用说明（带实例，装完自动显示）
   chenyu-pro credits                                       查用户名·余额
   【Agent 写作模式（默认）：写作由你的 Agent 完成，不消耗平台积分，平台只做鉴权与交付】
   chenyu-pro auth                                          鉴权门——Agent 动笔前必须通过(输出 AUTH_OK)
@@ -1590,14 +2288,26 @@ function cmdHelp() {
   chenyu-pro wash-check --dir <剧本目录> --source <分析稿目录> [--address]   对照原片查照抄/旧名残留/台词量/说话人在场/非人角色被接话，到 WASH_PASS
   chenyu-pro assets-export --dir <剧本目录> [--title 剧名]   导出全局资产清单（人物/形象/外观/场景/道具，.md + .json）+ 形象表.json
   chenyu-pro durations --dir <剧本目录> --source <分析稿目录> [--dry-run]   按原片写【原片时长】【本场时长】（视频还原/洗稿必跑）
+  chenyu-pro looks-prepare --dir <剧本目录>              形象设计任务：取知识库造型提示词+形象库，生成 形象设计.json（按客户端造型 AI 格式填，assets-export 并进形象表）
+  【成片工程改写——改客户端已分镜的工程（script.json / 导出的 .xlsx），不重新分镜，零积分】
+  chenyu-pro inspect <文件>                                判断输入是小说 / 剧本 / 工程 JSON / 工程 Excel，该走哪条路
+  chenyu-pro remake-prepare --src <工程.json|.xlsx> --dir <工作目录> [--images <工程.xlsx>]   读工程、盘点角色，生成 改写映射.json
+  chenyu-pro remake-units --dir <工作目录>                 按映射精确改名，拆出逐行改写单元和换性别形象表
+  chenyu-pro remake-lint --dir <工作目录> --file 第01集.patch.json   查一个补丁：结构问题 + 换性别角色残留词
+  chenyu-pro remake-review --dir <工作目录>                审稿读本：补丁打完后的剧本全文和每集分镜，给审稿逐集通读（修订补丁 审核_*.patch.json 最后生效）
+  chenyu-pro remake-apply --dir <工作目录> [--out 新工程.json]      合并补丁和新造型、清旧成片、校验，出新工程（REMAKE_PASS）
   chenyu-pro deliver-check --dir <剧本目录> --source <分析稿目录>   交付门：机器指标+审核结论.json(剧情完整/对话称呼/剧情逻辑)，列出下一轮要做的事，迭代到 DELIVERY_PASS
 
   市场: ${Object.entries(MARKETS).map(([k, v]) => k + '=' + v).join(' ')}
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, version: cmdVersion, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 try {
+  if (EDITION === 'gate' && commands[cmd] && !GATE_COMMANDS.has(cmd)) {
+    console.log(`「${cmd}」需要账号授权，属于辰屿 Pro 完整版功能（视频反推、形象设计、平台交付等）。免费版可用的命令见 chenyu-gate help。`);
+    process.exit(2);
+  }
   await (commands[cmd] || cmdHelp)();
 } catch (err) {
   // 顶层兜底：网络彻底不通时给出人话 + 恢复路径，绝不甩裸 node stack trace(会让 Agent 误判彻底失败而自造结果)。
@@ -1605,7 +2315,7 @@ try {
     console.error(`✗ 网络连接失败(${err.detail})：多次重试仍连不上平台 ${DEFAULT_PLATFORM}，通常是本机网络或代理(如 Clash)波动。`);
     console.error('  · 若刚在跑 video-analyze：视频多半已提交、平台在后台继续分析、积分不会白扣；网络恢复后用');
     console.error('    chenyu-pro video-fetch --project <剧名或id片段>   零积分取回，切勿整批重跑(会重复扣分)。');
-    console.error('  · 检查网络/代理后重试；确需经代理到平台可设环境变量 CHENYU_KEEP_PROXY=1。');
+    console.error('  · 直连失败会自动改走系统代理（环境变量 HTTP(S)_PROXY / Windows 系统代理 / macOS 系统代理）；都不通就检查网络。指定代理: CHENYU_PROXY=http://地址:端口；一开始就走系统代理: CHENYU_KEEP_PROXY=1。在 Agent 沙箱里跑的，先确认沙箱允许联网。');
     process.exit(1);
   }
   console.error('✗ 出错: ' + (err?.stack || err?.message || err));

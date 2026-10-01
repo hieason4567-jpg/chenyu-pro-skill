@@ -3,7 +3,7 @@
 # 装到 Codex + Claude Code 的 skills 目录，并创建全局 chenyu-pro 命令。需 Node 18+。
 $ErrorActionPreference = "Stop"
 $repo = "https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main"
-$files = @("SKILL.md", "scripts/chenyu_pro_cli.mjs", "scripts/asset_workbook.mjs", "scripts/wash_check.mjs", "scripts/deliver_check.mjs", "scripts/asset_export.mjs", "scripts/durations.mjs")
+$files = @("SKILL.md", "scripts/chenyu_pro_cli.mjs", "scripts/net.mjs", "scripts/asset_workbook.mjs", "scripts/wash_check.mjs", "scripts/deliver_check.mjs", "scripts/asset_export.mjs", "scripts/durations.mjs", "scripts/styling_static.json", "scripts/styling_audit.mjs", "scripts/remake.mjs", "scripts/excel_import.mjs", "scripts/storyboard_audit.mjs")
 
 $roots = @()
 $roots += Join-Path $env:USERPROFILE ".codex\skills"
@@ -35,9 +35,7 @@ if ($userPath -notlike "*$binDir*") {
 }
 
 Write-Host ""
-& node $cliPath help | Select-Object -First 2
-Write-Host ""
-Write-Host "Install complete. First use:" -ForegroundColor Green
-Write-Host "  chenyu-pro key set <credit-key>   (auto sign-in, no password needed)"
-Write-Host "  chenyu-pro credits"
+Write-Host "Install complete." -ForegroundColor Green
+# 使用说明：node 直接写终端（不经过管道，避免 PowerShell 把中文转成乱码）
+& node $cliPath guide
 # 不要 exit：用 irm | iex 运行时 exit 会直接关掉用户的 PowerShell 窗口，看不到安装结果
