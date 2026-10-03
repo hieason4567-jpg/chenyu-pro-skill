@@ -34,6 +34,12 @@ if ($userPath -notlike "*$binDir*") {
   Write-Host "  PATH updated (new terminals will have chenyu-pro)"
 }
 
+# 自带 ffmpeg：视频上传前必须压缩，本机没有 ffmpeg 就下载一份（约 29MB，只下一次；有系统代理会走代理）。
+# 下载失败不影响安装，第一次分析视频时还会再试。
+Write-Host ""
+Write-Host "  Checking ffmpeg (needed to compress videos before upload)..."
+& node $cliPath ffmpeg --install
+
 Write-Host ""
 Write-Host "Install complete." -ForegroundColor Green
 # 使用说明：node 直接写终端（不经过管道，避免 PowerShell 把中文转成乱码）
