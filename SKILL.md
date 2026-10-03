@@ -2,7 +2,7 @@
 name: chenyu-pro
 description: 辰屿 Pro —— 短剧剧本生产（Agent 编剧 Skill）。写/生成/洗稿/改编短剧剧本、视频反推剧本、剧本格式门与质检时使用。
 metadata:
-  version: "2.13.1"
+  version: "2.13.2"
 ---
 
 # 辰屿 Pro —— 短剧剧本生产（Agent 编剧 Skill）
@@ -79,6 +79,9 @@ chenyu-pro help          # 完整命令表
 
 CLI 位置：本 Skill 目录 `scripts/chenyu_pro_cli.mjs`，安装器已创建 `chenyu-pro` 全局命令；
 若命令不存在，用 `node <本Skill目录>/scripts/chenyu_pro_cli.mjs <命令>` 调用。
+
+**版本以 `chenyu-pro version` 为准**（不要看文件里的更新记录判断"最新版"）：它会顺带查线上最新版，
+提示本机是旧版时，先告诉用户重新运行安装命令升级，再开始干活。
 
 **命令都由你来敲，用户只说人话**：绝不要求用户自己运行命令。用户说"洗个稿""继续""给我
 看看"，你翻译成对应操作自己执行，然后用大白话回报结果与文件位置。
