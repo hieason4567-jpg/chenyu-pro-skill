@@ -2,7 +2,7 @@
 name: chenyu-pro
 description: 辰屿 Pro —— 短剧剧本生产（Agent 编剧 Skill）。写/生成/洗稿/改编短剧剧本、视频反推剧本、剧本格式门与质检时使用。用户一句话提到「辰屿」「辰屿技能」「用辰屿改编 / 反推 / 分析视频 / 洗稿 / 改名 / 出形象表 / 出资产图」就用本 Skill，不需要用户说出命令。
 metadata:
-  version: "2.26.1"
+  version: "2.26.2"
 ---
 
 # 辰屿 Pro —— 短剧剧本生产（Agent 编剧 Skill）
