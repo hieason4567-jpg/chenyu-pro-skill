@@ -1,6 +1,6 @@
 # 辰屿 Pro Skill
 
-当前版本 **v2.21.0**（以 `chenyu-pro version` 为准；重跑安装命令即升级）
+当前版本 **v2.21.1**（以 `chenyu-pro version` 为准；重跑安装命令即升级）
 
 短剧剧本生产平台的 AI Agent 操作员 Skill——装进 Codex / Claude Code 后，直接对 Agent 说
 "帮我把这个剧本洗成日本版，30 集"，Agent 自动完成：授权检查 → 积分预估 → 提交生产 →
@@ -16,7 +16,7 @@ irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/inst
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- 辰屿 Pro Skill v2.21.0 使用说明
+ 辰屿 Pro Skill v2.21.1 使用说明
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ■ 开始：绑定积分 KEY（只做一次）
