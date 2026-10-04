@@ -2,7 +2,7 @@
 name: chenyu-pro
 description: 辰屿 Pro —— 短剧剧本生产（Agent 编剧 Skill）。写/生成/洗稿/改编短剧剧本、视频反推剧本、剧本格式门与质检时使用。
 metadata:
-  version: "2.14.7"
+  version: "2.15.0"
 ---
 
 # 辰屿 Pro —— 短剧剧本生产（Agent 编剧 Skill）
@@ -383,6 +383,10 @@ N-1 日/夜 内/外 场景名
 2. **先读 `整理规则.md`，再通读三份清单和剧集摘要，按剧情填写 `资产合并表.json`**。`整理规则.md` 和平台自己整理时用的是同一份规则，下面是要点。
 3. `chenyu-pro assets-apply --dir <分析稿目录>` → 校验并出 `整理版/`。输出 `ASSETS_FAIL` 就按提示补表重跑，直到
    `ASSETS_PASS`。命令只按你填的表做一字不差的替换，**台词、字幕、镜头列原文不会被改动**。
+4. **到 `ASSETS_PASS` 后马上存档**：`chenyu-pro archive --project <项目> --dir <分析稿目录>`（零积分）。把你填的资产合并表和整理版合集
+   回传到平台项目里留档——只是记录，不改平台的原始分析稿，也不改项目状态。之后改过合并表、重新 `assets-apply` 了，再存一次（同名按最新的算）。
+   换机器、换 Agent 或上下文丢了要接着做时：`chenyu-pro video-fetch` 取回原始分析稿后，再 `chenyu-pro archive-fetch --project <项目> --dir <分析稿目录>`
+   把合并表和整理版取回来，不用重新合并。
 
 **人物怎么合并**：
 
@@ -559,6 +563,9 @@ N-1 日/夜 内/外 场景名
 ```
 
 **7. 交付**：做过视频分析的，直接回传到 `video-analyze` 建的那个项目（`save --project <分析项目号>`），不要另外 create；没做视频分析的才 create。`chenyu-pro save --dir` 回传 → `chenyu-pro fetch` 取回全剧合并版 → `chenyu-pro durations` 写原片时长（视频还原/洗稿/只改名都要）→ `chenyu-pro looks-prepare` + Agent 按造型任务书做形象设计 → `chenyu-pro assets-export` 导出全局资产清单和 `形象表.json`（客户端「人物设定与故事背景」上传它，按表建形象卡、按场绑定标签；导出时提示没写外观、非主形象没写原因的要补齐）→ 交给用户：剧本 + 全局资产清单 + 形象表.json + 资产映射表 +
+**存档是分阶段做的，不要攒到最后**：① 资产整理到 `ASSETS_PASS` → `archive`（合并表 + 整理版）；② 每写完一集、过了 gate → `save` 回传这一集正文；
+③ 全部写完、检查都通过 → 再跑一次 `archive`，用 `--file` 把洗稿/交付检查报告、形象表、改名映射等一起留档
+（`chenyu-pro archive --project <项目> --dir <分析稿目录> --file 洗稿检查报告.md,交付检查报告.md,形象表.json`）。中途断了也不会丢已经做完的部分。
 洗稿映射.json + 形象变体表（`variants`）+ **审核报告**（每一轮查出多少、改了多少、剩余警告为什么不改、按剧情判定的说话人/身份及依据）。
 项目号就是交付凭证。
 
